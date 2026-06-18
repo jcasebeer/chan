@@ -10,6 +10,15 @@ A minimal single-board imageboard (4chan-style textboard) written in C.
 
 It's one board — no `/v/`, `/b/`, `/x/` routing. Just threads and replies.
 
+## LLM note
+
+This entire thing was built with a (guided) llm (opus 4.8) in ~4 hours over two sessions. 
+You can see the prompts used in plan.txt. For the first 10 plans, each instruction to the 
+llm was just /goal read and execute the next part of the PLAN. For the remaining plans there
+was some follow-up in the chat interface that's not recorded here. I tried to run a few rounds 
+of simulated penetration testing with the llm (PLAN 7, PLAN8, PLAN10) but this code is likely
+not very trustworthy for now. 
+
 ## Build & run
 
 ```sh
@@ -83,10 +92,4 @@ disk. This guarantees every file in `web/uploads/` is owned by a row, so a crash
 mid-upload can only leave a dangling reference (a broken thumbnail cleaned up
 when the thread is pruned) — never an orphan file.
 
-## LLM note
 
-This entire thing was built with a (guided) llm (opus 4.8) in 2 hours. You can
-see the prompts used in plan.txt. Each instruction to the llm was just /goal read 
-and execute the next part of the PLAN. I tried to run a few rounds of simulated
-penetration testing with the llm (PLAN 7, PLAN8, PLAN10) but this code is likely still
-not very trustworthy. 
