@@ -37,6 +37,22 @@
 #endif
 #define UPLOAD_LOG "uploads.log"
 
+// Security headers for HTML responses: block content sniffing, framing
+// (clickjacking), and external resource loads. 'unsafe-inline' is required
+// because the UI uses inline <script>/onclick/hx-on handlers; server output is
+// HTML-escaped, so CSP here is defense-in-depth.
+#define HTML_HDRS                                                             \
+  "Content-Type: text/html; charset=utf-8\r\n"                               \
+  "X-Content-Type-Options: nosniff\r\n"                                      \
+  "X-Frame-Options: DENY\r\n"                                                \
+  "Content-Security-Policy: default-src 'self'; img-src 'self'; "            \
+  "media-src 'self'; style-src 'self' 'unsafe-inline'; "                     \
+  "script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; "  \
+  "frame-ancestors 'none'\r\n"
+
+// Plain-text error responses (rate limit, validation) still get nosniff.
+#define TEXT_HDRS "Content-Type: text/plain\r\nX-Content-Type-Options: nosniff\r\n"
+
 static sqlite3 *g_db;
 
 // ---------------------------------------------------------------------------
@@ -520,27 +536,36 @@ static const char *sniff_ext(struct mg_str f) {
   return NULL;
 }
 
-// Validate and persist an upload for post `id`. On success writes the stored
-// relative path (e.g. "uploads/12.png") into `stored` and returns 1.
-// Returns 0 if there is no file; -1 if the file is rejected (too big / bad type).
-static int save_upload(struct mg_str file, sqlite3_int64 id, char *stored,
-                       size_t storedn) {
+// Validate an upload (size + type) and compute its stored relative path
+// "uploads/<id>.<ext>" into `stored`. Does NOT touch disk. The extension is
+// derived from the in-memory magic bytes, so the name is known before any write.
+// Returns 0 if there is no file; 1 if valid; -1 if rejected (too big / bad type).
+static int upload_validate(struct mg_str file, sqlite3_int64 id, char *stored,
+                           size_t storedn) {
   if (file.len == 0) return 0;
   if (file.len > MAX_UPLOAD) return -1;
   const char *ext = sniff_ext(file);
   if (ext == NULL) return -1;
+  snprintf(stored, storedn, "uploads/%lld.%s", (long long) id, ext);
+  return 1;
+}
 
+// Write the upload bytes to disk at WEB_ROOT/<stored>. Returns 1 on success.
+// IMPORTANT: callers write the DB `image` reference BEFORE calling this, so the
+// on-disk file is always referenced by a row. A failure or crash here leaves at
+// most a dangling reference (a broken thumbnail that is cleaned up when the
+// thread is pruned) -- never an orphan file with no owning row.
+static int upload_write(struct mg_str file, const char *stored) {
   char path[256];
-  snprintf(path, sizeof(path), "%s/%lld.%s", UPLOAD_DIR, (long long) id, ext);
+  snprintf(path, sizeof(path), "%s/%s", WEB_ROOT, stored);
   FILE *f = fopen(path, "wb");
-  if (f == NULL) return -1;
+  if (f == NULL) return 0;
   size_t wrote = fwrite(file.buf, 1, file.len, f);
   fclose(f);
   if (wrote != file.len) {
-    remove(path);
-    return -1;
+    remove(path);  // drop a partial/corrupt write; the row's ref self-heals on prune
+    return 0;
   }
-  snprintf(stored, storedn, "uploads/%lld.%s", (long long) id, ext);
   return 1;
 }
 
@@ -555,14 +580,18 @@ static void delete_thread_files(sqlite3_int64 tid);  // defined with pruning bel
 // ---------------------------------------------------------------------------
 // Client IP (used for rate limiting and the upload log).
 // ---------------------------------------------------------------------------
-// Set from $CHAN_TRUST_PROXY at startup. When enabled we trust the
-// X-Forwarded-For header (for deployments behind a reverse proxy); otherwise we
-// use the TCP peer address, which cannot be trivially spoofed.
-static int g_trust_proxy;
+// Configured at startup from $CHAN_TRUSTED_PROXY (the reverse proxy's IP
+// address). We honor an X-Forwarded-For header ONLY when the request actually
+// arrives from that proxy; for any other peer the header is ignored and the TCP
+// peer address is used. This stops direct clients from spoofing XFF to bypass
+// rate limiting or forge their logged identity. Empty => never trust XFF.
+static char g_trusted_proxy[48];
 
 static void client_ip(struct mg_connection *c, struct mg_http_message *hm,
                       char *buf, size_t n) {
-  if (g_trust_proxy) {
+  char peer[48];
+  mg_snprintf(peer, sizeof(peer), "%M", mg_print_ip, &c->rem);
+  if (g_trusted_proxy[0] && strcmp(peer, g_trusted_proxy) == 0) {
     struct mg_str *xff = mg_http_get_header(hm, "X-Forwarded-For");
     if (xff != NULL && xff->len > 0) {
       // X-Forwarded-For: client, proxy1, proxy2 ... — the left-most entry is
@@ -580,7 +609,7 @@ static void client_ip(struct mg_connection *c, struct mg_http_message *hm,
       }
     }
   }
-  mg_snprintf(buf, n, "%M", mg_print_ip, &c->rem);
+  snprintf(buf, n, "%s", peer);
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +698,20 @@ static int rate_limit_check(const char *ip, time_t now) {
 // ---------------------------------------------------------------------------
 // Upload log: one line per upload recording IP, original filename, and MD5.
 // ---------------------------------------------------------------------------
+// Sanitize an untrusted string for safe one-line, one-field logging: keep
+// printable ASCII except the tab delimiter; replace anything else (control
+// chars, tabs, ANSI escapes, high bytes) with '_'. This prevents log-injection
+// and terminal-escape attacks via the upload filename or a spoofed IP.
+static void log_sanitize(char *dst, size_t cap, const char *src) {
+  if (cap == 0) return;
+  size_t j = 0;
+  for (const char *p = src; *p && j + 1 < cap; p++) {
+    unsigned char ch = (unsigned char) *p;
+    dst[j++] = (ch >= 0x20 && ch < 0x7f && ch != '\t') ? (char) ch : '_';
+  }
+  dst[j] = '\0';
+}
+
 static void log_upload(const char *ip, const char *orig, struct mg_str file,
                        const char *stored) {
   char hex[33];
@@ -680,9 +723,12 @@ static void log_upload(const char *ip, const char *orig, struct mg_str file,
   struct tm tm;
   gmtime_r(&now, &tm);
   strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm);
+  // ip and filename are attacker-influenced; sanitize before writing.
+  char sip[48], sname[256];
+  log_sanitize(sip, sizeof(sip), ip);
+  log_sanitize(sname, sizeof(sname), (orig && orig[0]) ? orig : "-");
   // Tab-separated: time, ip, md5, size, original filename, stored path.
-  fprintf(f, "%s\t%s\t%s\t%zu\t%s\t%s\n", ts, ip, hex, file.len,
-          (orig && orig[0]) ? orig : "-", stored);
+  fprintf(f, "%s\t%s\t%s\t%zu\t%s\t%s\n", ts, sip, hex, file.len, sname, stored);
   fclose(f);
 }
 
@@ -740,7 +786,7 @@ static void handle_index(struct mg_connection *c) {
   render_catalog(&s);
   sb_puts(&s, "</div>");
   page_foot(&s);
-  mg_http_reply(c, 200, "Content-Type: text/html; charset=utf-8\r\n", "%s", s.buf);
+  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf);
   sb_free(&s);
 }
 
@@ -755,7 +801,7 @@ static void handle_thread(struct mg_connection *c, long id) {
   sqlite3_bind_int64(st, 1, id);
   if (sqlite3_step(st) != SQLITE_ROW) {
     sqlite3_finalize(st);
-    mg_http_reply(c, 404, "Content-Type: text/html\r\n",
+    mg_http_reply(c, 404, HTML_HDRS,
                   "<h1>404</h1><p>No such thread. <a href=\"/\">Back</a></p>");
     return;
   }
@@ -781,7 +827,7 @@ static void handle_thread(struct mg_connection *c, long id) {
 
   render_form(&s, id);
   page_foot(&s);
-  mg_http_reply(c, 200, "Content-Type: text/html; charset=utf-8\r\n", "%s", s.buf);
+  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf);
   sb_free(&s);
 }
 
@@ -791,7 +837,7 @@ static void handle_new_thread(struct mg_connection *c, struct mg_http_message *h
   char *tname = trim(in.name), *tsubj = trim(in.subject), *tcom = trim(in.comment);
 
   if (tcom[0] == '\0') {
-    mg_http_reply(c, 400, "Content-Type: text/plain\r\n", "Comment required.");
+    mg_http_reply(c, 400, TEXT_HDRS, "Comment required.");
     return;
   }
 
@@ -800,7 +846,7 @@ static void handle_new_thread(struct mg_connection *c, struct mg_http_message *h
   client_ip(c, hm, ip, sizeof(ip));
   int wait = rate_limit_check(ip, (time_t) now);
   if (wait > 0) {
-    mg_http_reply(c, 429, "Content-Type: text/plain\r\n",
+    mg_http_reply(c, 429, TEXT_HDRS,
                   "You're posting too fast. Wait %d second%s.", wait,
                   wait == 1 ? "" : "s");
     return;
@@ -820,12 +866,16 @@ static void handle_new_thread(struct mg_connection *c, struct mg_http_message *h
   sqlite3_finalize(st);
 
   char stored[128] = {0};
-  if (in.has_file && save_upload(in.file, id, stored, sizeof(stored)) == 1) {
+  if (in.has_file && upload_validate(in.file, id, stored, sizeof(stored)) == 1) {
+    // Write the DB reference FIRST, then the file. A crash between the two can
+    // only leave a dangling reference (a broken thumbnail that is cleaned up on
+    // prune) -- never an orphan file with no owning row.
     sqlite3_prepare_v2(g_db, "UPDATE posts SET image=? WHERE id=?", -1, &st, NULL);
     sqlite3_bind_text(st, 1, stored, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, id);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    upload_write(in.file, stored);
     log_upload(ip, in.filename, in.file, stored);
     enforce_disk_quota();
   }
@@ -833,7 +883,7 @@ static void handle_new_thread(struct mg_connection *c, struct mg_http_message *h
   // Return just the new catalog cell; htmx prepends it to #catalog.
   struct sbuf s = {0};
   render_catalog_cell(&s, id, tsubj, tcom, stored[0] ? stored : NULL, 0);
-  mg_http_reply(c, 200, "Content-Type: text/html; charset=utf-8\r\n", "%s", s.buf);
+  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf);
   sb_free(&s);
 }
 
@@ -847,7 +897,7 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
   int exists = (sqlite3_step(st) == SQLITE_ROW);
   sqlite3_finalize(st);
   if (!exists) {
-    mg_http_reply(c, 404, "Content-Type: text/html\r\n",
+    mg_http_reply(c, 404, HTML_HDRS,
                   "<div class=\"empty\">Thread not found.</div>");
     return;
   }
@@ -856,7 +906,7 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
   parse_multipart(hm, &in);
   char *tname = trim(in.name), *tcom = trim(in.comment);
   if (tcom[0] == '\0') {
-    mg_http_reply(c, 400, "Content-Type: text/plain\r\n", "Comment required.");
+    mg_http_reply(c, 400, TEXT_HDRS, "Comment required.");
     return;
   }
 
@@ -865,7 +915,7 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
   client_ip(c, hm, ip, sizeof(ip));
   int wait = rate_limit_check(ip, (time_t) now);
   if (wait > 0) {
-    mg_http_reply(c, 429, "Content-Type: text/plain\r\n",
+    mg_http_reply(c, 429, TEXT_HDRS,
                   "You're posting too fast. Wait %d second%s.", wait,
                   wait == 1 ? "" : "s");
     return;
@@ -883,12 +933,16 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
   sqlite3_finalize(st);
 
   char stored[128] = {0};
-  if (in.has_file && save_upload(in.file, id, stored, sizeof(stored)) == 1) {
+  if (in.has_file && upload_validate(in.file, id, stored, sizeof(stored)) == 1) {
+    // Write the DB reference FIRST, then the file. A crash between the two can
+    // only leave a dangling reference (a broken thumbnail that is cleaned up on
+    // prune) -- never an orphan file with no owning row.
     sqlite3_prepare_v2(g_db, "UPDATE posts SET image=? WHERE id=?", -1, &st, NULL);
     sqlite3_bind_text(st, 1, stored, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, id);
     sqlite3_step(st);
     sqlite3_finalize(st);
+    upload_write(in.file, stored);
     log_upload(ip, in.filename, in.file, stored);
     enforce_disk_quota();
   }
@@ -916,7 +970,7 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
   // htmx swaps this into #thread-<tid>.
   struct sbuf s = {0};
   render_thread_contents(&s, tid);
-  mg_http_reply(c, 200, "Content-Type: text/html; charset=utf-8\r\n", "%s", s.buf);
+  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf);
   sb_free(&s);
 }
 
@@ -938,11 +992,23 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     handle_new_thread(c, hm);
   } else if (mg_match(hm->uri, mg_str("/reply/*"), caps) && is_post) {
     handle_reply(c, hm, strtol(caps[0].buf, NULL, 10));
+  } else if (mg_match(hm->uri, mg_str("/uploads/#"), NULL) && !is_post) {
+    // User-uploaded files: serve with nosniff and a restrictive sandbox CSP so
+    // that even a polyglot (a valid GIF that is also HTML/JS) cannot run script
+    // if opened directly, and is never MIME-sniffed into HTML.
+    struct mg_http_serve_opts opts = {
+        .root_dir = WEB_ROOT,
+        .mime_types = "webm=video/webm",
+        .extra_headers = "X-Content-Type-Options: nosniff\r\n"
+                         "Content-Security-Policy: sandbox; default-src 'none'\r\n"};
+    mg_http_serve_dir(c, hm, &opts);
   } else {
-    // Static assets (style.css, htmx.min.js, uploads/*) from WEB_ROOT.
+    // Other static assets (style.css, htmx.min.js) from WEB_ROOT.
     // webm is not in mongoose's built-in MIME table, so add it explicitly.
-    struct mg_http_serve_opts opts = {.root_dir = WEB_ROOT,
-                                      .mime_types = "webm=video/webm"};
+    struct mg_http_serve_opts opts = {
+        .root_dir = WEB_ROOT,
+        .mime_types = "webm=video/webm",
+        .extra_headers = "X-Content-Type-Options: nosniff\r\n"};
     mg_http_serve_dir(c, hm, &opts);
   }
 }
@@ -1037,8 +1103,8 @@ int main(int argc, char **argv) {
   const char *url = (argc > 1) ? argv[1] : "http://0.0.0.0:8000";
 
   setvbuf(stdout, NULL, _IOLBF, 0);  // line-buffer logs so they appear promptly
-  const char *tp = getenv("CHAN_TRUST_PROXY");
-  g_trust_proxy = (tp != NULL && tp[0] && tp[0] != '0');
+  const char *tp = getenv("CHAN_TRUSTED_PROXY");
+  if (tp != NULL) snprintf(g_trusted_proxy, sizeof(g_trusted_proxy), "%s", tp);
   mkdir(UPLOAD_DIR, 0755);  // ensure upload directory exists (ok if present)
   if (db_init() != 0) return 1;
 
@@ -1048,8 +1114,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "cannot listen on %s\n", url);
     return 1;
   }
-  printf("chan listening on %s  (db: %s, trust_proxy: %s)\n", url, DB_PATH,
-         g_trust_proxy ? "on" : "off");
+  printf("chan listening on %s  (db: %s, trusted_proxy: %s)\n", url, DB_PATH,
+         g_trusted_proxy[0] ? g_trusted_proxy : "(none)");
   time_t last_cleanup = 0;
   for (;;) {
     mg_mgr_poll(&mgr, 200);

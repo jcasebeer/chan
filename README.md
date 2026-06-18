@@ -47,15 +47,19 @@ Several limits are compile-time tunables: `BUMP_LIMIT` (300 posts), `DELETE_AFTE
 - **Rate limiting**: at most one post per IP per minute, held in an in-memory
   open-addressed hash table (FNV-1a hashing, linear probing, auto-resizing);
   over-limit posts get a message without losing the typed text. Behind a reverse
-  proxy, set `CHAN_TRUST_PROXY=1` to key off the left-most `X-Forwarded-For`
-  entry instead of the TCP peer address
+  proxy, set `CHAN_TRUSTED_PROXY=<proxy-ip>` to key off the left-most
+  `X-Forwarded-For` entry — but only when the request actually arrives from that
+  proxy address, so direct clients can't spoof their IP
 - **Upload log** (`uploads.log`): one tab-separated line per upload recording
-  time, IP, MD5, size, original filename, and stored path
+  time, IP, MD5, size, original filename, and stored path (untrusted fields are
+  sanitized to defeat log/terminal-escape injection)
 - **Disk quota / "OOM killer"**: when the upload directory exceeds a configurable
   size (default 8 GiB) whole threads are purged at random until back under it
 - Threads bump to the top of the catalog when they get a reply
 - Greentext (`>like this`) and quote links (`>>123`)
-- All user input is HTML-escaped server-side (XSS-safe)
+- All user input is HTML-escaped server-side (XSS-safe). Responses carry
+  security headers (`nosniff`, CSP, `X-Frame-Options`); uploads are served with a
+  sandbox CSP so polyglot files can't execute as HTML. See `SECURITY.md`.
 
 Uploads are written to `web/uploads/` and served as static files.
 
@@ -74,8 +78,15 @@ A single `posts` table. A row with `thread_id IS NULL` is an opening post (a
 thread); a row with `thread_id` set is a reply to that thread. Threads carry a
 `bumped_at` used for index ordering.
 
+On upload, the DB `image` reference is written **before** the file is written to
+disk. This guarantees every file in `web/uploads/` is owned by a row, so a crash
+mid-upload can only leave a dangling reference (a broken thumbnail cleaned up
+when the thread is pruned) — never an orphan file.
+
 ## LLM note
 
 This entire thing was built with a (guided) llm (opus 4.8) in 2 hours. You can
 see the prompts used in plan.txt. Each instruction to the llm was just /goal read 
-and execute the next part of the PLAN. 
+and execute the next part of the PLAN. I tried to run a few rounds of simulated
+penetration testing with the llm (PLAN 7, PLAN8, PLAN10) but this code is likely still
+not very trustworthy. 

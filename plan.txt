@@ -59,13 +59,20 @@ PLAN 6 - COMPLETE
 -implement the cache with an open-addressed hash table instead of linear search
 do not hallucinate hash functions look up a real one that is OK for the web
 
-PLAN 7 - TODO
+PLAN 7 - COMPLETE
 -run a few rounds of red team/blue team
 -red team tries to attack the server and do something they shouldn't be able to
 -if red team intrudes successfully, blue team responds and fixes the intrusion vector
 -both red and blue team have full knowledge of the source code
 
+PLAN 8 - COMPLETE
+-run a few more rounds of red team/blue team using the same rules from PLAN 7
+-red team, focus on trying to exfiltrate the contents of the file "../JUICY_PAYLOAD_FOR_RED_TEAM.txt"
+(no cheating!)
 
+PLAN 9 - COMPLETE
+-reorder db/file write on upload so that orphaned files are impossible
 
-
-        
+PLAN 10 - COMPLETE
+-one final pentest round, try to exfiltrate the contents of the juicy payload which
+is now in the current working directory.

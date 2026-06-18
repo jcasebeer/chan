@@ -7,3 +7,4 @@ uploads.log
 # user uploads (keep the directory, ignore its contents)
 web/uploads/*
 !web/uploads/.gitkeep
+*.swp
