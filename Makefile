@@ -11,7 +11,8 @@ BIN  = chan
 SQLITE_FLAGS = -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION
 # mongoose caps the recv buffer at 3 MiB by default; raise it for 8 MiB uploads.
 # MG_ENABLE_DIRLIST=0 disables directory listings (no enumerating /uploads/).
-MG_FLAGS = -DMG_MAX_RECV_SIZE=12582912 -DMG_ENABLE_DIRLIST=0
+# MG_ENABLE_EPOLL=1 uses epoll instead of select (scales past FD_SETSIZE ~1024).
+MG_FLAGS = -DMG_MAX_RECV_SIZE=12582912 -DMG_ENABLE_DIRLIST=0 -DMG_ENABLE_EPOLL=1
 
 .PHONY: all run clean
 

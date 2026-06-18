@@ -76,3 +76,38 @@ PLAN 9 - COMPLETE
 PLAN 10 - COMPLETE
 -one final pentest round, try to exfiltrate the contents of the juicy payload which
 is now in the current working directory.
+
+PLAN 11 - COMPLETE
+-fix the n^2 complexity code in render_thread_contents with a prepass that builds an in
+memory map (fixed size based on bump limit)
+-switch to epoll
+
+PLAN 12 - COMPLETE
+-set a static size limit for the contents of a post (name, subject, body) = (32, 256, 4096)
+-use the static limits to replace all malloc/realloc/calloc calls when building a reply with pushes to a large preallocated
+scratch buffer which is just freed (by resetting its 'frame pointer"). API should be
+
+size_t save = scratch_save();
+// malloc/calloc
+char *data = scratch_alloc(sizeof(char)*1000);
+scratch_restore(save);
+
+-if you notice friction with the implied stack shape of this malloc/free replacement
+that is a good indication that we need to add another static size limit, or in some cases
+that operations should be reordered.
+-bump limit should prevent further replies, not just mark the thread for deletion
+-add a thread limit
+
+PLAN 13 - COMPLETE
+-leverage browser caching to cut bandwidth, especially for uploads (the biggest hog)
+-uploads are immutable (path is uploads/<rowid>.<ext> and ids are AUTOINCREMENT, never
+reused), so serve them with Cache-Control: public, max-age=1y, immutable so the browser
+serves repeat views from cache with no revalidation round-trip (mongoose already sends an
+Etag for a cheap 304 after expiry/eviction)
+-static assets (style.css, htmx.min.js) can change, so cache them for a modest window
+(max-age=1h) and rely on the Etag for revalidation after that
+-dynamic HTML (catalog, thread pages) must stay fresh, so send Cache-Control: no-cache
+so it is always revalidated and never heuristically cached stale
+
+PLAN 14 - COMPLETE
+-replace growable hash table with a fixed size cache that replaces the entry on collision

@@ -19,12 +19,18 @@
 #define WEB_ROOT "web"
 #define UPLOAD_DIR WEB_ROOT "/uploads"
 #define DB_PATH "chan.db"
-#define MAX_NAME 64
-#define MAX_SUBJECT 128
-#define MAX_COMMENT 8000
+// Static per-field size limits (bytes, excluding the NUL). These bound how much
+// any single post can contribute to a rendered page, which in turn lets the
+// render path run entirely off a fixed-size scratch arena (see below).
+#define MAX_NAME 32
+#define MAX_SUBJECT 256
+#define MAX_COMMENT 4096
 #define MAX_UPLOAD (8 * 1024 * 1024)  // 8 MiB
 #ifndef BUMP_LIMIT
-#define BUMP_LIMIT 300                // posts (OP + replies) before a thread stops bumping
+#define BUMP_LIMIT 300                // posts (OP + replies); the limit BLOCKS further replies
+#endif
+#ifndef THREAD_LIMIT
+#define THREAD_LIMIT 100              // max live threads; oldest are pruned to bound the catalog
 #endif
 #ifndef DELETE_AFTER
 #define DELETE_AFTER (8 * 3600)       // seconds after hitting the bump limit before deletion
@@ -43,6 +49,7 @@
 // HTML-escaped, so CSP here is defense-in-depth.
 #define HTML_HDRS                                                             \
   "Content-Type: text/html; charset=utf-8\r\n"                               \
+  "Cache-Control: no-cache\r\n"                                              \
   "X-Content-Type-Options: nosniff\r\n"                                      \
   "X-Frame-Options: DENY\r\n"                                                \
   "Content-Security-Policy: default-src 'self'; img-src 'self'; "            \
@@ -54,6 +61,96 @@
 #define TEXT_HDRS "Content-Type: text/plain\r\nX-Content-Type-Options: nosniff\r\n"
 
 static sqlite3 *g_db;
+
+// ---------------------------------------------------------------------------
+// Per-request scratch arena.
+//
+// One large buffer is allocated once at startup; every per-request render
+// allocation (the HTML sbuf, the loaded posts[], the per-post backlink buffers)
+// bump-allocates from it and the whole frame is freed in O(1) by restoring the
+// offset at the end of the request. This replaces malloc/realloc/calloc/strdup
+// in the hot render path and hard-bounds the memory one request can consume: the
+// static field-size limits, the reply-blocking bump limit, and the thread limit
+// together make the worst-case page size finite.
+//
+// API (stack discipline):
+//   size_t save = scratch_save();
+//   char *p = scratch_alloc(n);   // or scratch_calloc / scratch_realloc / scratch_strdup
+//   scratch_restore(save);        // frees everything allocated since `save`
+//
+// NOTE: the long-lived rate-limit hash table is deliberately NOT part of this
+// arena -- it must persist across requests, so it stays on the heap.
+//
+// Worst case is dominated by backlinks: each of up to BUMP_LIMIT posts can quote
+// every other post, so total backlink text is O(BUMP_LIMIT^2). That text is held
+// once in the bl[] buffers and again in the response, each grown by doubling
+// (~2x slack), plus the escaped bodies. 64 MiB covers the adversarial worst case
+// for the default limits; on exhaustion allocations return NULL and callers
+// degrade to truncated output rather than crashing.
+#ifndef SCRATCH_BYTES
+#define SCRATCH_BYTES (64u * 1024 * 1024)
+#endif
+
+static char *g_scratch;
+static size_t g_scratch_cap;
+static size_t g_scratch_off;
+static int g_scratch_oom;  // latched if any alloc overflowed the current frame
+
+static size_t scratch_save(void) { return g_scratch_off; }
+
+static void scratch_restore(size_t save) {
+  g_scratch_off = save;
+  if (save == 0) g_scratch_oom = 0;  // clear the OOM latch at the outermost frame
+}
+
+// Bump-allocate `n` bytes, 16-byte aligned. Returns NULL (latching the OOM flag)
+// if the arena is exhausted.
+static void *scratch_alloc(size_t n) {
+  size_t off = (g_scratch_off + 15u) & ~(size_t) 15u;
+  if (off > g_scratch_cap || n > g_scratch_cap - off) {
+    g_scratch_oom = 1;
+    return NULL;
+  }
+  g_scratch_off = off + n;
+  return g_scratch + off;
+}
+
+static void *scratch_calloc(size_t count, size_t size) {
+  size_t n = count * size;  // counts here are bounded by the post/thread limits
+  void *p = scratch_alloc(n);
+  if (p != NULL) memset(p, 0, n);
+  return p;
+}
+
+// Grow a prior scratch allocation. If `old` is the most-recent (top) allocation
+// it is extended in place -- the common, stack-shaped case. Otherwise a fresh
+// block is allocated and the contents copied; the old bytes are abandoned until
+// the frame is restored (correct for interleaved growth, just not space-optimal).
+static void *scratch_realloc(void *old, size_t oldn, size_t newn) {
+  if (old != NULL) {
+    char *p = (char *) old;
+    if (p + oldn == g_scratch + g_scratch_off) {  // `old` is the arena top
+      size_t base = (size_t) (p - g_scratch);
+      if (newn <= g_scratch_cap - base) {
+        g_scratch_off = base + newn;
+        return old;
+      }
+      g_scratch_oom = 1;
+      return NULL;
+    }
+  }
+  void *fresh = scratch_alloc(newn);
+  if (fresh != NULL && old != NULL && oldn > 0) memcpy(fresh, old, oldn);
+  return fresh;
+}
+
+static char *scratch_strdup(const char *s) {
+  if (s == NULL) return NULL;
+  size_t n = strlen(s) + 1;
+  char *p = (char *) scratch_alloc(n);
+  if (p != NULL) memcpy(p, s, n);
+  return p;
+}
 
 // ---------------------------------------------------------------------------
 // Dynamic string buffer used to build HTML responses.
@@ -68,12 +165,15 @@ static void sb_grow(struct sbuf *s, size_t need) {
   if (s->len + need + 1 <= s->cap) return;
   size_t cap = s->cap ? s->cap : 1024;
   while (s->len + need + 1 > cap) cap *= 2;
-  s->buf = (char *) realloc(s->buf, cap);
+  char *nb = (char *) scratch_realloc(s->buf, s->cap, cap);
+  if (nb == NULL) return;  // arena exhausted: keep the old buffer, drop the growth
+  s->buf = nb;
   s->cap = cap;
 }
 
 static void sb_append(struct sbuf *s, const char *data, size_t n) {
   sb_grow(s, n);
+  if (s->len + n + 1 > s->cap) return;  // grow failed (arena exhausted): truncate
   memcpy(s->buf + s->len, data, n);
   s->len += n;
   s->buf[s->len] = '\0';
@@ -90,14 +190,17 @@ static void sb_printf(struct sbuf *s, const char *fmt, ...) {
   va_end(ap);
   if (n < 0) return;
   sb_grow(s, (size_t) n);
+  if (s->len + (size_t) n + 1 > s->cap) return;  // grow failed: truncate
   va_start(ap, fmt);
   vsnprintf(s->buf + s->len, (size_t) n + 1, fmt, ap);
   va_end(ap);
   s->len += (size_t) n;
 }
 
+// sbuf storage lives in the scratch arena, so there is nothing to free here;
+// the whole frame is reclaimed by scratch_restore() at the end of the request.
+// This just resets the handle so it can't be reused after the frame is gone.
 static void sb_free(struct sbuf *s) {
-  free(s->buf);
   s->buf = NULL;
   s->len = s->cap = 0;
 }
@@ -125,6 +228,7 @@ static void sb_esc(struct sbuf *s, const char *str) {
 // Operates on raw text, emitting HTML-escaped output.
 // ---------------------------------------------------------------------------
 static void format_comment(struct sbuf *s, const char *text) {
+  if (text == NULL) return;
   const char *p = text;
   while (*p) {
     // Find end of this line.
@@ -326,20 +430,6 @@ static int reply_count(sqlite3_int64 tid) {
   return n;
 }
 
-// True if `comment` contains a quote link (>>N) referencing post `target`.
-static int comment_refs(const char *comment, sqlite3_int64 target) {
-  if (comment == NULL) return 0;
-  for (const char *p = comment; (p = strstr(p, ">>")) != NULL;) {
-    p += 2;
-    if (*p < '0' || *p > '9') continue;
-    char *end;
-    long v = strtol(p, &end, 10);
-    if (v == (long) target) return 1;
-    p = end;
-  }
-  return 0;
-}
-
 // One post loaded into memory so we can compute reply backlinks across a thread.
 struct tpost {
   sqlite3_int64 id;
@@ -347,6 +437,19 @@ struct tpost {
   sqlite3_int64 created;
   int is_op;
 };
+
+// Binary search for the post with `id` in the id-sorted posts[] array (loaded
+// ORDER BY id ASC). Returns its index, or -1 if not in this thread.
+static int tpost_index(const struct tpost *posts, int n, sqlite3_int64 id) {
+  int lo = 0, hi = n - 1;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (posts[mid].id == id) return mid;
+    if (posts[mid].id < id) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return -1;
+}
 
 // Render a thread's inner content: OP, then a .replies container with each
 // reply. Each post is annotated with backlinks to the posts that reply to it.
@@ -361,12 +464,21 @@ static void render_thread_contents(struct sbuf *s, sqlite3_int64 tid) {
   sqlite3_bind_int64(st, 1, tid);
   sqlite3_bind_int64(st, 2, tid);
 
+  // posts[] is bump-allocated; the reply-blocking bump limit caps a thread at
+  // BUMP_LIMIT posts, so a fresh thread never grows past it. Legacy threads that
+  // predate the limit may have more rows -- scratch_realloc handles any n, and on
+  // arena exhaustion we simply stop loading (the page renders what fit).
   struct tpost *posts = NULL;
   int n = 0, cap = 0;
   while (sqlite3_step(st) == SQLITE_ROW) {
     if (n == cap) {
-      cap = cap ? cap * 2 : 16;
-      posts = (struct tpost *) realloc(posts, (size_t) cap * sizeof(*posts));
+      int newcap = cap ? cap * 2 : 16;
+      struct tpost *np =
+          (struct tpost *) scratch_realloc(posts, (size_t) cap * sizeof(*posts),
+                                           (size_t) newcap * sizeof(*posts));
+      if (np == NULL) break;  // arena exhausted: render what we have
+      posts = np;
+      cap = newcap;
     }
     struct tpost *p = &posts[n++];
     const char *nm = (const char *) sqlite3_column_text(st, 1);
@@ -374,42 +486,58 @@ static void render_thread_contents(struct sbuf *s, sqlite3_int64 tid) {
     const char *cm = (const char *) sqlite3_column_text(st, 3);
     const char *im = (const char *) sqlite3_column_text(st, 5);
     p->id = sqlite3_column_int64(st, 0);
-    p->name = nm ? strdup(nm) : NULL;
-    p->subject = sj ? strdup(sj) : NULL;
-    p->comment = cm ? strdup(cm) : strdup("");
+    p->name = scratch_strdup(nm);
+    p->subject = scratch_strdup(sj);
+    p->comment = cm ? scratch_strdup(cm) : scratch_strdup("");
     p->created = sqlite3_column_int64(st, 4);
-    p->image = im ? strdup(im) : NULL;
+    p->image = scratch_strdup(im);
     p->is_op = sqlite3_column_int(st, 6);
   }
   sqlite3_finalize(st);
 
-  // posts[0] is the OP (lowest id). Render OP, open .replies, then the replies.
-  for (int i = 0; i < n; i++) {
-    struct sbuf bl = {0};
-    for (int j = 0; j < n; j++) {
-      if (j != i && comment_refs(posts[j].comment, posts[i].id)) {
-        sb_printf(&bl,
+  // Prepass: build every post's backlinks in O(total comment text) rather than
+  // the old O(n^2) (which rescanned every comment for every post — an unbounded,
+  // unauthenticated CPU sink on GET /thread for large threads). For each post we
+  // scan its comment once for ">>N" quote links and append a backlink onto the
+  // referenced target. `bl[i]` accumulates the backlinks shown on post i; `seen`
+  // dedups so quoting the same post twice in one comment yields one backlink.
+  // Both arrays are sized to the actual post count n (a thread is kept small by
+  // the bump limit), so there is no fixed-cap overflow even if replies arrive
+  // after the limit but before pruning.
+  struct sbuf *bl = (struct sbuf *) scratch_calloc((size_t) (n > 0 ? n : 1), sizeof(*bl));
+  int *seen = (int *) scratch_alloc((size_t) (n > 0 ? n : 1) * sizeof(*seen));
+  if (bl == NULL || seen == NULL) return;  // arena exhausted before the prepass
+  for (int i = 0; i < n; i++) seen[i] = -1;
+  for (int j = 0; j < n; j++) {
+    for (const char *p = posts[j].comment; (p = strstr(p, ">>")) != NULL;) {
+      p += 2;
+      if (*p < '0' || *p > '9') continue;
+      char *endp;
+      long ref = strtol(p, &endp, 10);
+      p = endp;
+      int ti = tpost_index(posts, n, (sqlite3_int64) ref);
+      if (ti >= 0 && ti != j && seen[ti] != j) {
+        seen[ti] = j;
+        sb_printf(&bl[ti],
                   "<a class=\"quotelink backlink\" href=\"#p%lld\" "
                   "onclick=\"return quote(%lld)\">&gt;&gt;%lld</a> ",
                   (long long) posts[j].id, (long long) posts[j].id,
                   (long long) posts[j].id);
       }
     }
+  }
+
+  // posts[0] is the OP (lowest id). Render OP, open .replies, then the replies.
+  for (int i = 0; i < n; i++) {
     render_post(s, posts[i].is_op, posts[i].id, posts[i].name, posts[i].subject,
                 posts[i].comment, posts[i].created, (long) tid, posts[i].image,
-                bl.buf);
-    sb_free(&bl);
+                bl[i].buf);
     if (i == 0) sb_puts(s, "<div class=\"replies\">");
   }
   if (n > 0) sb_puts(s, "</div>");  // close .replies
-
-  for (int i = 0; i < n; i++) {
-    free(posts[i].name);
-    free(posts[i].subject);
-    free(posts[i].comment);
-    free(posts[i].image);
-  }
-  free(posts);
+  // No frees: posts[], bl[], seen[], the strdup'd fields, and every bl[i].buf all
+  // live in the scratch arena and are reclaimed wholesale by scratch_restore()
+  // when the request frame unwinds (see ev_handler).
 }
 
 // Append `comment` truncated to ~140 chars, HTML-escaped, for catalog excerpts.
@@ -615,84 +743,79 @@ static void client_ip(struct mg_connection *c, struct mg_http_message *hm,
 // ---------------------------------------------------------------------------
 // Rate limiting: at most one post per IP per RATE_WINDOW seconds (in-memory).
 //
-// Backed by an open-addressed hash table (linear probing) keyed by the IP
-// string. Hashing uses FNV-1a (Fowler-Noll-Vo), a well-known non-cryptographic
-// string hash with good distribution for short keys. (FNV is not resistant to
-// crafted-collision DoS; a keyed hash such as SipHash would be needed for
-// attacker-chosen keys, but these keys are peer IPs, not user input.)
-// Entries older than RATE_WINDOW count as free and are reclaimed in place.
+// Fixed-size, direct-mapped cache: each client IP is reduced to a 32-bit key
+// (see ip_key) and mapped to exactly one slot, slot = mix64(key) & (RL_SLOTS-1).
+// There is no probing and no resizing -- on a collision (two different keys land
+// in the same slot) the newcomer simply replaces the incumbent. The table is a
+// flat array allocated once, so memory is constant regardless of how many
+// distinct IPs are seen. A replaced entry just loses its timer, so the failure
+// mode is fail-open (an occasional extra post slips through).
+//
+// Slots store the key too, so we only enforce the window on a genuine key match;
+// a colliding key is treated as a fresh client. Keys are derived from validated
+// client IPs (and IPv6 is folded to its /64), not attacker-chosen input, so a
+// non-cryptographic integer avalanche (the splitmix64 finalizer) is sufficient.
 // ---------------------------------------------------------------------------
+#ifndef RL_SLOTS
+#define RL_SLOTS (1u << 20)  // 1,048,576 slots * 8 bytes = 8 MiB, fixed; must be 2^k
+#endif
+
 struct rl_slot {
-  char ip[48];  // empty string => unused slot
-  time_t last;
+  uint32_t key;   // folded 32-bit IP key (key==0 && last==0 => never used)
+  uint32_t last;  // unix time (seconds) of the last accepted post from this key
 };
-static struct rl_slot *g_rl;
-static size_t g_rl_cap;   // always a power of two
-static size_t g_rl_used;  // occupied slots (live or not-yet-reclaimed)
+static struct rl_slot g_rl[RL_SLOTS];  // zero-initialized; never grows or moves
 
-static uint64_t fnv1a(const char *s) {
-  uint64_t h = 1469598103934665603ULL;  // FNV-1a 64-bit offset basis
-  for (; *s; s++) {
-    h ^= (unsigned char) *s;
-    h *= 1099511628211ULL;  // FNV-1a 64-bit prime
-  }
-  return h;
+// splitmix64 finalizer: a strong xorshift-multiply avalanche, the single-word
+// analogue of a hash finalizer. Used to spread keys across slots.
+static uint64_t mix64(uint64_t x) {
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
 }
 
-// Grow (or initialize) the table to newcap slots, rehashing only live entries
-// (expired ones are dropped, which incidentally cleans the table).
-static void rl_resize(size_t newcap, time_t now) {
-  struct rl_slot *old = g_rl;
-  size_t oldcap = g_rl_cap;
-  g_rl = (struct rl_slot *) calloc(newcap, sizeof(*g_rl));
-  g_rl_cap = newcap;
-  g_rl_used = 0;
-  for (size_t i = 0; i < oldcap; i++) {
-    if (old[i].ip[0] && (now - old[i].last) < RATE_WINDOW) {
-      size_t idx = fnv1a(old[i].ip) & (newcap - 1);
-      while (g_rl[idx].ip[0]) idx = (idx + 1) & (newcap - 1);
-      g_rl[idx] = old[i];
-      g_rl_used++;
+// Reduce a textual client IP to a 32-bit key. IPv4 uses the full address; IPv6
+// is keyed by its /64 prefix (one actor typically owns a whole /64 and can
+// rotate the low 64 bits at will, so per-address limiting is meaningless) folded
+// to 32 bits. An unparseable address maps to key 0.
+static uint32_t ip_key(const char *ip) {
+  struct mg_addr a;
+  memset(&a, 0, sizeof(a));
+  if (!mg_aton(mg_str(ip), &a)) return 0;
+  if (a.is_ip6) {
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d), e.g. an IPv4 client on our dual-stack
+    // socket: key by the embedded IPv4 so v4 clients aren't all collapsed into
+    // the single all-zero /64 prefix.
+    static const uint8_t v4mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (memcmp(a.addr.ip, v4mapped, 12) == 0) {
+      uint32_t v4;
+      memcpy(&v4, a.addr.ip + 12, 4);
+      return v4;
     }
+    uint64_t m = mix64(a.addr.ip6[0]);  // top 64 bits = the /64 prefix
+    return (uint32_t) (m ^ (m >> 32));
   }
-  free(old);
+  return a.addr.ip4;  // 32-bit IPv4 address (network byte order)
 }
 
-// Returns 0 if a post from `ip` is allowed now (recording the time); otherwise
+// Returns 0 if a post from `key` is allowed now (recording the time); otherwise
 // returns the number of seconds the caller must still wait.
-static int rate_limit_check(const char *ip, time_t now) {
-  if (g_rl == NULL) rl_resize(1024, now);
-  size_t mask = g_rl_cap - 1;
-  size_t idx = fnv1a(ip) & mask;
-  long reuse = -1;  // first expired slot we may reclaim if the key is absent
-
-  for (size_t n = 0; n < g_rl_cap; n++) {
-    struct rl_slot *s = &g_rl[idx];
-    if (s->ip[0] == '\0') {  // empty slot => key not present, insert it
-      size_t t = (reuse >= 0) ? (size_t) reuse : idx;
-      if (g_rl[t].ip[0] == '\0') g_rl_used++;  // only a fresh slot grows usage
-      snprintf(g_rl[t].ip, sizeof(g_rl[t].ip), "%s", ip);
-      g_rl[t].last = now;
-      if (g_rl_used * 10 > g_rl_cap * 7) rl_resize(g_rl_cap * 2, now);
-      return 0;
-    }
-    if (strcmp(s->ip, ip) == 0) {  // found the key's canonical slot
-      if ((now - s->last) >= RATE_WINDOW) {  // window elapsed => allow
-        s->last = now;
-        return 0;
-      }
-      int wait = RATE_WINDOW - (int) (now - s->last);
-      return wait > 0 ? wait : 1;
-    }
-    if (reuse < 0 && (now - s->last) >= RATE_WINDOW) reuse = (long) idx;
-    idx = (idx + 1) & mask;
+static int rate_limit_check(uint32_t key, time_t now) {
+  struct rl_slot *s = &g_rl[mix64(key) & (RL_SLOTS - 1)];
+  // Only enforce the window on a true key match within RATE_WINDOW; unsigned
+  // subtraction makes a fresh slot (last==0) always read as long-expired.
+  if (s->key == key && (uint32_t) now - s->last < (uint32_t) RATE_WINDOW) {
+    int wait = (int) ((uint32_t) RATE_WINDOW - ((uint32_t) now - s->last));
+    return wait > 0 ? wait : 1;
   }
-  // Table full of live entries (pathological); reuse an expired slot if any.
-  if (reuse >= 0) {
-    snprintf(g_rl[reuse].ip, sizeof(g_rl[reuse].ip), "%s", ip);
-    g_rl[reuse].last = now;
-  }
-  return 0;  // fail open
+  // New key, expired window, or a colliding key: claim the slot (replacing any
+  // incumbent) and allow. Replacement only ever costs another IP its timer.
+  s->key = key;
+  s->last = (uint32_t) now;
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +898,42 @@ static void enforce_disk_quota(void) {
   }
 }
 
+// Keep at most THREAD_LIMIT threads on the board. When a new thread pushes the
+// count over the limit, prune the least-recently-bumped threads (and their
+// uploads). This bounds the catalog/index page so its rendered size -- and the
+// scratch arena it builds in -- stays finite regardless of how many threads are
+// created. Call after inserting a new OP.
+static void enforce_thread_limit(void) {
+  for (;;) {
+    sqlite3_stmt *st;
+    int count = 0;
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT COUNT(*) FROM posts WHERE thread_id IS NULL", -1, &st,
+            NULL) == SQLITE_OK) {
+      if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (count <= THREAD_LIMIT) break;
+
+    sqlite3_int64 tid = 0;
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id FROM posts WHERE thread_id IS NULL "
+            "ORDER BY bumped_at ASC LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
+      if (sqlite3_step(st) == SQLITE_ROW) tid = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (tid == 0) break;  // nothing to prune (shouldn't happen); avoid spinning
+
+    delete_thread_files(tid);
+    sqlite3_prepare_v2(g_db, "DELETE FROM posts WHERE id=? OR thread_id=?", -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, tid);
+    sqlite3_bind_int64(st, 2, tid);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    printf("thread limit exceeded: pruned oldest thread %lld\n", (long long) tid);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers.
 // ---------------------------------------------------------------------------
@@ -786,7 +945,7 @@ static void handle_index(struct mg_connection *c) {
   render_catalog(&s);
   sb_puts(&s, "</div>");
   page_foot(&s);
-  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf);
+  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf ? s.buf : "");
   sb_free(&s);
 }
 
@@ -827,7 +986,7 @@ static void handle_thread(struct mg_connection *c, long id) {
 
   render_form(&s, id);
   page_foot(&s);
-  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf);
+  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf ? s.buf : "");
   sb_free(&s);
 }
 
@@ -844,7 +1003,7 @@ static void handle_new_thread(struct mg_connection *c, struct mg_http_message *h
   sqlite3_int64 now = (sqlite3_int64) time(NULL);
   char ip[48];
   client_ip(c, hm, ip, sizeof(ip));
-  int wait = rate_limit_check(ip, (time_t) now);
+  int wait = rate_limit_check(ip_key(ip), (time_t) now);
   if (wait > 0) {
     mg_http_reply(c, 429, TEXT_HDRS,
                   "You're posting too fast. Wait %d second%s.", wait,
@@ -880,10 +1039,13 @@ static void handle_new_thread(struct mg_connection *c, struct mg_http_message *h
     enforce_disk_quota();
   }
 
+  // Bound the board: prune the oldest threads if this OP pushed us over the limit.
+  enforce_thread_limit();
+
   // Return just the new catalog cell; htmx prepends it to #catalog.
   struct sbuf s = {0};
   render_catalog_cell(&s, id, tsubj, tcom, stored[0] ? stored : NULL, 0);
-  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf);
+  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf ? s.buf : "");
   sb_free(&s);
 }
 
@@ -902,6 +1064,24 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
     return;
   }
 
+  // Enforce the bump limit as a hard cap: once a thread holds BUMP_LIMIT posts
+  // (OP + replies) it is full and accepts no further replies. Record the moment
+  // the limit was reached (if not already) so pruning still kicks in, then reject.
+  int existing = reply_count(tid) + 1;  // +1 for the OP
+  if (existing >= BUMP_LIMIT) {
+    sqlite3_prepare_v2(g_db,
+        "UPDATE posts SET bumplimit_at=? WHERE id=? AND bumplimit_at IS NULL",
+        -1, &st, NULL);
+    sqlite3_bind_int64(st, 1, (sqlite3_int64) time(NULL));
+    sqlite3_bind_int64(st, 2, tid);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    mg_http_reply(c, 403, TEXT_HDRS,
+                  "Thread is full (bump limit of %d reached). No more replies.",
+                  BUMP_LIMIT);
+    return;
+  }
+
   struct post_input in;
   parse_multipart(hm, &in);
   char *tname = trim(in.name), *tcom = trim(in.comment);
@@ -913,7 +1093,7 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
   sqlite3_int64 now = (sqlite3_int64) time(NULL);
   char ip[48];
   client_ip(c, hm, ip, sizeof(ip));
-  int wait = rate_limit_check(ip, (time_t) now);
+  int wait = rate_limit_check(ip_key(ip), (time_t) now);
   if (wait > 0) {
     mg_http_reply(c, 429, TEXT_HDRS,
                   "You're posting too fast. Wait %d second%s.", wait,
@@ -947,8 +1127,9 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
     enforce_disk_quota();
   }
 
-  // Bump the thread, unless it has reached the bump limit (OP + replies >= limit).
-  int total = reply_count(tid) + 1;  // +1 for the OP
+  // Bump the thread, unless this reply is the one that reaches the bump limit
+  // (the gate above already rejected anything past it).
+  int total = existing + 1;  // posts now in the thread, including this reply + OP
   if (total < BUMP_LIMIT) {
     sqlite3_prepare_v2(g_db, "UPDATE posts SET bumped_at=? WHERE id=?", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, now);
@@ -970,7 +1151,7 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
   // htmx swaps this into #thread-<tid>.
   struct sbuf s = {0};
   render_thread_contents(&s, tid);
-  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf);
+  mg_http_reply(c, 200, HTML_HDRS, "%s", s.buf ? s.buf : "");
   sb_free(&s);
 }
 
@@ -984,6 +1165,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 
   int is_post = (mg_strcmp(hm->method, mg_str("POST")) == 0);
 
+  // Open a scratch frame for the whole request; every render allocation bump-
+  // allocates from the arena and is freed in one shot when we restore below.
+  // (Mongoose's event loop is single-threaded, so frames never overlap.)
+  size_t scratch_frame = scratch_save();
+
   if (mg_match(hm->uri, mg_str("/"), NULL) && !is_post) {
     handle_index(c);
   } else if (mg_match(hm->uri, mg_str("/thread/*"), caps) && !is_post) {
@@ -996,21 +1182,39 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     // User-uploaded files: serve with nosniff and a restrictive sandbox CSP so
     // that even a polyglot (a valid GIF that is also HTML/JS) cannot run script
     // if opened directly, and is never MIME-sniffed into HTML.
+    // Uploads are immutable: the stored path is "uploads/<rowid>.<ext>" and the
+    // schema uses AUTOINCREMENT, so a path is never reused with different bytes.
+    // Tell the browser it can serve repeat views straight from cache without
+    // revalidating (no conditional round-trip) for a year. Mongoose also sends an
+    // Etag, so after expiry (or a cache eviction) it still gets a cheap 304.
     struct mg_http_serve_opts opts = {
         .root_dir = WEB_ROOT,
         .mime_types = "webm=video/webm",
         .extra_headers = "X-Content-Type-Options: nosniff\r\n"
+                         "Cache-Control: public, max-age=31536000, immutable\r\n"
                          "Content-Security-Policy: sandbox; default-src 'none'\r\n"};
     mg_http_serve_dir(c, hm, &opts);
   } else {
     // Other static assets (style.css, htmx.min.js) from WEB_ROOT.
     // webm is not in mongoose's built-in MIME table, so add it explicitly.
+    // These can change (e.g. style.css edits), so cache for an hour rather than
+    // marking immutable; the Etag still yields a cheap 304 once max-age expires.
     struct mg_http_serve_opts opts = {
         .root_dir = WEB_ROOT,
         .mime_types = "webm=video/webm",
-        .extra_headers = "X-Content-Type-Options: nosniff\r\n"};
+        .extra_headers = "X-Content-Type-Options: nosniff\r\n"
+                         "Cache-Control: public, max-age=3600\r\n"};
     mg_http_serve_dir(c, hm, &opts);
   }
+
+  if (g_scratch_oom) {
+    // The page exceeded the scratch arena and was truncated. With the static
+    // field/bump/thread limits this should be unreachable; if it fires, raise
+    // SCRATCH_BYTES. Logged (not fatal) -- the server stays up and bounded.
+    printf("warning: scratch arena exhausted serving %.*s (response truncated)\n",
+           (int) hm->uri.len, hm->uri.buf);
+  }
+  scratch_restore(scratch_frame);  // free this request's entire arena frame
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,6 +1310,16 @@ int main(int argc, char **argv) {
   const char *tp = getenv("CHAN_TRUSTED_PROXY");
   if (tp != NULL) snprintf(g_trusted_proxy, sizeof(g_trusted_proxy), "%s", tp);
   mkdir(UPLOAD_DIR, 0755);  // ensure upload directory exists (ok if present)
+
+  // One-time scratch arena for the per-request render path (freed per request via
+  // scratch_save/restore, not torn down until exit).
+  g_scratch_cap = SCRATCH_BYTES;
+  g_scratch = (char *) malloc(g_scratch_cap);
+  if (g_scratch == NULL) {
+    fprintf(stderr, "cannot allocate %zu-byte scratch arena\n", g_scratch_cap);
+    return 1;
+  }
+
   if (db_init() != 0) return 1;
 
   struct mg_mgr mgr;
@@ -1129,3 +1343,4 @@ int main(int argc, char **argv) {
   sqlite3_close(g_db);
   return 0;
 }
+

@@ -129,9 +129,60 @@ defenses held; no breach achieved or fabricated. The only thing that would defen
 a *hypothetical* future traversal regression is OS-level containment (run as an
 unprivileged user in its own dir / container, ideally read-only FS).
 
+## PLAN 11 — fix the O(n²) thread-render DoS  ✅ fixed
+
+`render_thread_contents` computed reply backlinks in O(n²) (it rescanned every
+comment for every post), and `GET /thread/N` is unauthenticated and not rate
+limited — an attacker could repeatedly fetch a large thread to burn CPU on the
+single-threaded event loop (a complexity-DoS amplifier). Replaced with an O(n)
+prepass: each comment is scanned once for `>>N` quote links, and backlinks are
+appended onto the referenced target via a binary-search id→index lookup
+(`posts[]` is id-sorted), with a small `seen[]` array to dedup repeats. Backlink
+output is byte-identical (verified across multi-quote, duplicate-quote,
+dangling-ref, and self-quote cases). A/B benchmark: the quadratic backlink term
+(old−new render time) grew ~4× per post-count doubling (26 ms → 99 ms from
+n=300→600) and is now eliminated; new render time is linear in thread size.
+
+## PLAN 12 — bound per-request memory (static limits + scratch arena)  ✅ done
+
+Two related hardening goals: make the memory a single request can consume
+*provably finite*, and remove per-request heap churn from the render path.
+
+- **Static field-size limits.** Name / subject / body are capped at 32 / 256 /
+  4096 bytes at parse time (`copy_mgstr` truncates into fixed buffers). This
+  bounds each post's contribution to a rendered page.
+- **Reply-blocking bump limit.** The bump limit is now a *hard cap*: once a
+  thread holds `BUMP_LIMIT` posts it returns `403` to further replies (it still
+  records `bumplimit_at` so pruning proceeds). Previously the limit only stopped
+  bumping, so a thread could grow without bound between hitting the limit and
+  being pruned — an unbounded input to the O(n) render.
+- **Thread limit.** At most `THREAD_LIMIT` threads live at once; creating a new
+  OP prunes the least-recently-bumped threads (and their uploads). This bounds
+  the catalog/index page.
+- **Per-request scratch arena.** A single buffer is allocated once at startup;
+  the HTML builder (`sbuf`), the loaded `posts[]`, and the per-post backlink
+  buffers all bump-allocate from it (`scratch_save` / `scratch_alloc` /
+  `scratch_realloc` / `scratch_restore`) and are freed in O(1) when the request
+  frame unwinds in `ev_handler`. This replaces all per-request
+  malloc/realloc/calloc/strdup in the render path. The long-lived rate-limit
+  hash table is deliberately **excluded** — it must persist across requests, so
+  it stays on the heap.
+
+With the field/bump/thread limits in place the worst-case page size is finite,
+so `SCRATCH_BYTES` (64 MiB default) is a hard ceiling on per-request memory. If
+a page ever exceeds the arena, allocations return `NULL` and the builder
+degrades to **truncated output** (logged) rather than overflowing or crashing —
+verified under ASan/UBSan with a deliberately tiny 64 KiB arena (forced
+exhaustion produced no memory errors), and the full-size happy path renders
+complete threads with no truncation and no sanitizer findings.
+
 ## Known residual risks / future work
 
 - CSP uses `'unsafe-inline'` because the UI relies on inline `<script>`/`onclick`/
   `hx-on` handlers; output escaping remains the primary XSS defense.
 - `CHAN_TRUSTED_PROXY` accepts a single proxy IP (no CIDR / multi-hop list).
 - No CSRF tokens on the post/reply forms (anonymous board, no accounts/sessions).
+- `GET` endpoints aren't rate limited. Thread render is O(n) and response size is
+  now bounded by the bump/thread/field limits (PLAN 12), but a worst-case thread
+  can still render a multi-MB page on each fetch — consider caching rendered
+  threads if read-amplification DoS becomes a concern.
