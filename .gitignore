@@ -1,0 +1,9 @@
+/chan
+chan.db
+chan.db-wal
+chan.db-shm
+uploads.log
+*.o
+# user uploads (keep the directory, ignore its contents)
+web/uploads/*
+!web/uploads/.gitkeep

@@ -1,0 +1,175 @@
+:root {
+  --bg: #ffffee;
+  --text: #800000;
+  --link: #0000ee;
+  --post-bg: #f0e0d6;
+  --post-border: #d9bfb7;
+  --green: #789922;
+  --header: #af0a0f;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: #000;
+  font-family: arial, helvetica, sans-serif;
+  font-size: 10pt;
+  margin: 0;
+  padding: 0 8px 40px;
+}
+a { color: var(--link); text-decoration: none; }
+a:hover { color: #dd0000; }
+.banner {
+  text-align: center;
+  padding: 8px 0 2px;
+}
+.banner h1 {
+  color: var(--header);
+  font-family: Tahoma, sans-serif;
+  font-size: 28pt;
+  font-weight: bold;
+  margin: 0;
+  letter-spacing: -1px;
+}
+.banner .sub { color: var(--text); font-style: italic; }
+hr { border: none; border-top: 1px solid #b7c5d9; clear: both; margin: 6px 0; }
+
+.postform {
+  margin: 6px auto 10px;
+  border-collapse: collapse;
+}
+.postform table { margin: 0 auto; }
+.postform td { padding: 1px; }
+.postform .lbl {
+  background: #ea8;
+  color: #800;
+  font-weight: bold;
+  text-align: left;
+  padding: 2px 6px;
+  border: 1px solid #800;
+}
+.postform input[type=text], .postform textarea {
+  border: 1px solid #aaa;
+  font-family: inherit;
+  font-size: 10pt;
+  width: 100%;
+}
+.postform textarea { width: 308px; height: 90px; }
+.postform input[type=text] { width: 250px; }
+.postform input[type=submit] { font-weight: bold; }
+
+.thread { margin: 4px 0 0; clear: both; }
+.post {
+  background: var(--post-bg);
+  border: 1px solid var(--post-border);
+  border-left: none;
+  border-top: none;
+  /* flow-root => block-level (posts stack downward) AND a block formatting
+     context, so the post grows to contain a floated image even when the image
+     is taller than the comment. fit-content keeps the box only as wide as its
+     content, without the shrink-to-fit table quirk that squeezed the comment
+     into a narrow column beside a floated image. */
+  display: flow-root;
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px 6px 6px;
+  margin: 4px 0;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.op { background: transparent; border: none; width: auto; padding: 2px 0; }
+.reply { margin-left: 20px; clear: both; }
+.postinfo { font-size: 10pt; }
+.name { color: #117743; font-weight: bold; }
+.subject { color: var(--text); font-weight: bold; }
+/* Post number is a clickable quote trigger: render it green + link-like. */
+.postnum a { color: #117743; font-weight: bold; cursor: pointer; }
+.postnum a:hover { color: #d00000; text-decoration: underline; }
+.date { color: #000; }
+.comment {
+  /* overflow:hidden establishes a block formatting context so the comment
+     sits beside the floated image and uses the full remaining width, wrapping
+     only at that width (the "media object" pattern). */
+  overflow: hidden;
+  margin: 8px 0 4px 20px;
+  line-height: 1.3;
+  white-space: normal;
+}
+/* When an image is present the float's own right margin provides the gap, so
+   drop the comment's left indent to avoid double spacing. */
+.has-image .comment { margin-left: 0; }
+.quote { color: var(--green); }
+.quotelink { color: var(--link); }
+/* Backlinks: small references to the posts that reply to this one. */
+.backlinks { margin-left: 6px; font-size: 9pt; }
+.backlinks .backlink { margin-right: 2px; }
+.meta { font-size: 9pt; color: #555; margin-left: 20px; }
+.nav { text-align: center; margin: 6px 0; font-size: 9pt; }
+.empty { text-align: center; color: #777; font-style: italic; margin: 20px; }
+.hint { font-size: 8pt; color: #777; }
+/* Server error feedback (rate limit, validation), populated by page JS. */
+.notice { color: #d00000; font-weight: bold; text-align: center; }
+.notice:empty { display: none; }
+
+/* The post linked via #pNN (e.g. after clicking a >>NN quote) is highlighted
+   with a distinctly darker shade so it's obvious which post is selected. */
+.post:target, .op:target {
+  background: #f0c0b0;
+  outline: 1px solid #b8927a;
+}
+
+/* Uploaded file thumbnail inside a post (floated, comment wraps beside it). */
+.file { float: left; margin: 4px 18px 4px 0; }
+.thumb {
+  max-width: 220px;
+  max-height: 220px;
+  display: block;
+  border: none;
+}
+
+/* Catalog grid: thread OPs as compact cells, content stacks/wraps, never
+   stretching a thread across the page. */
+.catalog {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 4px;
+}
+.cat-cell {
+  width: 165px;
+  background: var(--post-bg);
+  border: 1px solid var(--post-border);
+  padding: 4px;
+  text-align: center;
+  font-size: 9pt;
+  overflow: hidden;
+  vertical-align: top;
+}
+.cat-link { display: block; }
+.cat-thumb {
+  max-width: 150px;
+  max-height: 150px;
+  display: inline-block;
+  border: none;
+}
+.cat-noimg {
+  width: 150px;
+  height: 80px;
+  line-height: 80px;
+  color: #999;
+  background: #e4d3c8;
+}
+.cat-stats { font-weight: bold; color: #555; margin: 2px 0; }
+.cat-subject { color: var(--text); font-weight: bold; }
+.cat-excerpt { color: #000; word-wrap: break-word; }
+
+/* Bump-limit indicators: threads that hit the limit are marked red. */
+.cat-cell.bumplimit { border-color: #d00000; }
+.cat-cell.bumplimit .cat-stats { color: #d00000; }
+.bumpnotice {
+  color: #d00000;
+  font-weight: bold;
+  text-align: center;
+  margin: 6px 0;
+}
+.thread.bumplimit > .op .postnum a { color: #d00000; }

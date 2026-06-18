@@ -1,0 +1,71 @@
+PLAN 1 - COMPLETE
+
+build a 4chan board clone in c using the following stack:
+1. mongoose
+2. sqlite
+3. htmx
+
+It just needs to be a single "board", no need to recreate /v/ /b/ /x/ etc
+
+PLAN 2 - COMPLETE
+
+make the board display threads "catalog" style
+allow image (png, gif, jpg) and webm uploads under 8 mib
+fix thread contents filling space to the right, they should just go
+down. Allow replying to a post in a thread by clicking the post number
+
+PLAN 3 - COMPLETE
+
+Text wraps too soon when an image is uploaded, so instead of looking like this
+
+-------
+|     | hello good sir
+|Image| 
+|     |
+-------
+
+it looks like this
+
+------- hell
+|     | o
+|Image| go
+|     | od
+------- sir
+
+sometimes when the image is taller than wide, it looks OK
+
+once that's fixed, make the post number green so that it's visibly clickable, and
+make the post that is selected with the #PN selector a slightly darker shade so that
+it's obvious it's highlighted
+
+PLAN 4 - COMPLETE
+
+remove the [reply] button to the right of the posts, the green link is enough.
+to the right of a post, add clickable links to each of its replies that take you to the
+reply
+set a bump limit of 300 posts, which causes the board to be marked as red, and delete the thread
+and all of the uploads after 8 hours
+
+PLAN 5 - COMPLETE
+
+-rate limit posts to one post every minute with an in-memory cache based on ip
+-add a log per upload which records ip, filename, and md5 of file
+-add an oom killer which randomly purges a thread when the total disk size of uploads exceeds some configurable value (say 8 gigs)
+-if you need an external library to do the md5, prefer something single header that can be vendored like the other libs
+
+PLAN 6 - COMPLETE
+
+-implement X-Forward-For to handle ip caching when behind a reverse proxy
+-implement the cache with an open-addressed hash table instead of linear search
+do not hallucinate hash functions look up a real one that is OK for the web
+
+PLAN 7 - TODO
+-run a few rounds of red team/blue team
+-red team tries to attack the server and do something they shouldn't be able to
+-if red team intrudes successfully, blue team responds and fixes the intrusion vector
+-both red and blue team have full knowledge of the source code
+
+
+
+
+        
