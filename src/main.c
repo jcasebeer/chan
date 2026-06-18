@@ -41,7 +41,7 @@
 #define DELETE_AFTER (8 * 3600)       // seconds after hitting the bump limit before deletion
 #endif
 #ifndef RATE_WINDOW
-#define RATE_WINDOW 30                // min seconds between posts from one IP
+#define RATE_WINDOW 5                // min seconds between posts from one IP
 #endif
 #ifndef MAX_DISK_BYTES
 #define MAX_DISK_BYTES (8LL * 1024 * 1024 * 1024)  // upload dir quota: 8 GiB
@@ -534,11 +534,11 @@ static void render_thread_contents(struct sbuf *s, sqlite3_int64 tid) {
       int ti = tpost_index(posts, n, (sqlite3_int64) ref);
       if (ti >= 0 && ti != j && seen[ti] != j) {
         seen[ti] = j;
+        // A backlink jumps to the replying post (its href anchor); unlike the
+        // post-number link, it must NOT quote into the reply box.
         sb_printf(&bl[ti],
-                  "<a class=\"quotelink backlink\" href=\"#p%lld\" "
-                  "onclick=\"return quote(%lld)\">&gt;&gt;%lld</a> ",
-                  (long long) posts[j].id, (long long) posts[j].id,
-                  (long long) posts[j].id);
+                  "<a class=\"quotelink backlink\" href=\"#p%lld\">&gt;&gt;%lld</a> ",
+                  (long long) posts[j].id, (long long) posts[j].id);
       }
     }
   }

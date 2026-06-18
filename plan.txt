@@ -136,3 +136,6 @@ PLAN 16 - COMPLETE
 add a preliminary step to build the vendored mongoose and sqlite libs
 as their own compilation units. The goal is to get a compile time speedup
 
+PLAN 17 - COMPLETE
+the >>N that gets added to the right of a post when someone replies to it
+is supposed to take you to the repliers post, not fill the reply box.

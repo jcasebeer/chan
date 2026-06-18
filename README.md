@@ -29,14 +29,19 @@ make
 
 Then open the URL in a browser. State is stored in `chan.db` (created on first run).
 
-Several limits are compile-time tunables: `BUMP_LIMIT` (300 posts), `DELETE_AFTER`
-(8h, seconds), `RATE_WINDOW` (30s between posts per IP), and `MAX_DISK_BYTES`
-(8 GiB upload quota). Override them for testing, e.g.
-`make CFLAGS="-O2 -DBUMP_LIMIT=4 -DDELETE_AFTER=3 -DRATE_WINDOW=0"`.
+Several limits are compile-time tunables: `BUMP_LIMIT` (300 posts), `THREAD_LIMIT`
+(100 live threads), `DELETE_AFTER` (8h, seconds), `RATE_WINDOW` (5s between posts
+per IP), `MAX_DISK_BYTES` (8 GiB upload quota), `MAX_UPLOAD` (8 MiB per file), and
+the per-field size caps `MAX_NAME` / `MAX_SUBJECT` / `MAX_COMMENT`
+(32 / 256 / 4096 bytes). Override them for testing, e.g.
+`make clean && make CFLAGS="-O2 -DBUMP_LIMIT=4 -DDELETE_AFTER=3 -DRATE_WINDOW=0"`
+(`make clean` first, since changing flags alone doesn't trigger a rebuild of the
+cached objects).
 
 ## Features
 
-- Start threads (name / subject / comment) and reply to them
+- Start threads (name / subject / comment) and reply to them — fields are capped
+  at 32 / 256 / 4096 bytes
 - htmx-powered posting: new threads and replies appear without a full reload
 - **Catalog-style index**: threads shown as a grid of thumbnail cells with
   reply counts; click a cell to open the thread
@@ -46,16 +51,23 @@ Several limits are compile-time tunables: `BUMP_LIMIT` (300 posts), `DELETE_AFTE
 - **Click a post number** (`No.123`) in a thread to quote it — inserts `>>123`
   into the reply box and focuses it. Post numbers are green to signal they're
   clickable, and the post you jump to via a `>>123` link is highlighted
-- **Reply backlinks**: each post shows clickable links to the posts that reply
-  to it (computed from `>>NN` quotes across the thread)
-- **Bump limit**: after 300 posts a thread stops bumping and is marked red (in
-  the catalog and on the thread page); 8 hours later the thread and all its
-  uploads are pruned automatically
+- **Reply backlinks**: each post shows links to the posts that reply to it
+  (computed from `>>NN` quotes across the thread); clicking one jumps to that
+  reply (unlike the post-number link, it doesn't quote into the reply box)
+- **Bump limit**: after 300 posts a thread stops bumping, is marked red (in the
+  catalog and on the thread page), and **rejects further replies** (it's full);
+  8 hours later the thread and all its uploads are pruned automatically
+- **Thread limit**: the board keeps at most 100 live threads — creating a new
+  thread prunes the least-recently-bumped one (and its uploads) to bound the
+  catalog
 - Comments fill the width beside an uploaded image (media-object layout) rather
   than wrapping into a narrow column
-- **Rate limiting**: at most one post per IP per minute, held in an in-memory
-  open-addressed hash table (FNV-1a hashing, linear probing, auto-resizing);
-  over-limit posts get a message without losing the typed text. Behind a reverse
+- **Rate limiting**: at most one post per IP per `RATE_WINDOW` seconds (default 5),
+  held in a fixed-size, direct-mapped in-memory cache. Each IP is reduced to a
+  32-bit key (the full IPv4 address, or the `/64` prefix for IPv6) and mapped to a
+  single slot via a splitmix64 mix; a collision just overwrites the slot
+  (fail-open), so memory is constant regardless of how many IPs are seen.
+  Over-limit posts get a message without losing the typed text. Behind a reverse
   proxy, set `CHAN_TRUSTED_PROXY=<proxy-ip>` to key off the left-most
   `X-Forwarded-For` entry — but only when the request actually arrives from that
   proxy address, so direct clients can't spoof their IP
@@ -64,6 +76,10 @@ Several limits are compile-time tunables: `BUMP_LIMIT` (300 posts), `DELETE_AFTE
   sanitized to defeat log/terminal-escape injection)
 - **Disk quota / "OOM killer"**: when the upload directory exceeds a configurable
   size (default 8 GiB) whole threads are purged at random until back under it
+- **Browser caching**: uploads are immutable (`uploads/<id>.<ext>`, never reused),
+  so they're served `Cache-Control: immutable` for a year; static assets cache for
+  an hour (Etag-revalidated after); dynamic HTML is `no-cache` so the catalog and
+  threads never render stale
 - Threads bump to the top of the catalog when they get a reply
 - Greentext (`>like this`) and quote links (`>>123`)
 - All user input is HTML-escaped server-side (XSS-safe). Responses carry
