@@ -1,22 +1,21 @@
 PLAN 1 - COMPLETE
 
-build a 4chan board clone in c using the following stack:
-1. mongoose
-2. sqlite
-3. htmx
+build a 4chan board clone in c using the following stack: 1. mongoose
+2. sqlite 3. htmx
 
 It just needs to be a single "board", no need to recreate /v/ /b/ /x/ etc
 
 PLAN 2 - COMPLETE
 
-make the board display threads "catalog" style
-allow image (png, gif, jpg) and webm uploads under 8 mib
-fix thread contents filling space to the right, they should just go
-down. Allow replying to a post in a thread by clicking the post number
+make the board display threads "catalog" style allow image (png, gif,
+jpg) and webm uploads under 8 mib fix thread contents filling space
+to the right, they should just go down. Allow replying to a post in a
+thread by clicking the post number
 
 PLAN 3 - COMPLETE
 
-Text wraps too soon when an image is uploaded, so instead of looking like this
+Text wraps too soon when an image is uploaded, so instead of looking
+like this
 
 -------
 |     | hello good sir
@@ -34,89 +33,106 @@ it looks like this
 
 sometimes when the image is taller than wide, it looks OK
 
-once that's fixed, make the post number green so that it's visibly clickable, and
-make the post that is selected with the #PN selector a slightly darker shade so that
-it's obvious it's highlighted
+once that's fixed, make the post number green so that it's visibly
+clickable, and make the post that is selected with the #PN selector a
+slightly darker shade so that it's obvious it's highlighted
 
 PLAN 4 - COMPLETE
 
-remove the [reply] button to the right of the posts, the green link is enough.
-to the right of a post, add clickable links to each of its replies that take you to the
-reply
-set a bump limit of 300 posts, which causes the board to be marked as red, and delete the thread
-and all of the uploads after 8 hours
+remove the [reply] button to the right of the posts, the green link
+is enough.  to the right of a post, add clickable links to each of its
+replies that take you to the reply set a bump limit of 300 posts, which
+causes the board to be marked as red, and delete the thread and all of
+the uploads after 8 hours
 
 PLAN 5 - COMPLETE
 
--rate limit posts to one post every minute with an in-memory cache based on ip
--add a log per upload which records ip, filename, and md5 of file
--add an oom killer which randomly purges a thread when the total disk size of uploads exceeds some configurable value (say 8 gigs)
--if you need an external library to do the md5, prefer something single header that can be vendored like the other libs
+-rate limit posts to one post every minute with an in-memory cache based
+on ip -add a log per upload which records ip, filename, and md5 of file
+-add an oom killer which randomly purges a thread when the total disk
+size of uploads exceeds some configurable value (say 8 gigs) -if you
+need an external library to do the md5, prefer something single header
+that can be vendored like the other libs
 
 PLAN 6 - COMPLETE
 
 -implement X-Forward-For to handle ip caching when behind a reverse proxy
--implement the cache with an open-addressed hash table instead of linear search
-do not hallucinate hash functions look up a real one that is OK for the web
+-implement the cache with an open-addressed hash table instead of linear
+search do not hallucinate hash functions look up a real one that is OK
+for the web
 
 PLAN 7 - COMPLETE
--run a few rounds of red team/blue team
--red team tries to attack the server and do something they shouldn't be able to
--if red team intrudes successfully, blue team responds and fixes the intrusion vector
--both red and blue team have full knowledge of the source code
+-run a few rounds of red team/blue team -red team tries
+to attack the server and do something they shouldn't be able to -if red
+team intrudes successfully, blue team responds and fixes the intrusion
+vector -both red and blue team have full knowledge of the source code
 
 PLAN 8 - COMPLETE
--run a few more rounds of red team/blue team using the same rules from PLAN 7
--red team, focus on trying to exfiltrate the contents of the file "../JUICY_PAYLOAD_FOR_RED_TEAM.txt"
-(no cheating!)
+-run a few more rounds of red team/blue team using
+the same rules from PLAN 7 -red team, focus on trying to exfiltrate the
+contents of the file "../JUICY_PAYLOAD_FOR_RED_TEAM.txt" (no cheating!)
 
 PLAN 9 - COMPLETE
--reorder db/file write on upload so that orphaned files are impossible
+-reorder db/file write on upload so that orphaned
+files are impossible
 
 PLAN 10 - COMPLETE
--one final pentest round, try to exfiltrate the contents of the juicy payload which
-is now in the current working directory.
+-one final pentest round, try to exfiltrate the
+contents of the juicy payload which is now in the current working
+directory.
 
 PLAN 11 - COMPLETE
--fix the n^2 complexity code in render_thread_contents with a prepass that builds an in
-memory map (fixed size based on bump limit)
--switch to epoll
+-fix the n^2 complexity code in render_thread_contents
+with a prepass that builds an in memory map (fixed size based on bump
+limit) -switch to epoll
 
 PLAN 12 - COMPLETE
--set a static size limit for the contents of a post (name, subject, body) = (32, 256, 4096)
--use the static limits to replace all malloc/realloc/calloc calls when building a reply with pushes to a large preallocated
-scratch buffer which is just freed (by resetting its 'frame pointer"). API should be
+-set a static size limit for the contents of a post
+(name, subject, body) = (32, 256, 4096) -use the static limits to replace
+all malloc/realloc/calloc calls when building a reply with pushes to a
+large preallocated scratch buffer which is just freed (by resetting its
+'frame pointer"). API should be
 
-size_t save = scratch_save();
-// malloc/calloc
-char *data = scratch_alloc(sizeof(char)*1000);
-scratch_restore(save);
+size_t save = scratch_save(); // malloc/calloc char *data =
+scratch_alloc(sizeof(char)*1000); scratch_restore(save);
 
--if you notice friction with the implied stack shape of this malloc/free replacement
-that is a good indication that we need to add another static size limit, or in some cases
-that operations should be reordered.
--bump limit should prevent further replies, not just mark the thread for deletion
--add a thread limit
+-if you notice friction with the implied stack shape of this malloc/free
+replacement that is a good indication that we need to add another static
+size limit, or in some cases that operations should be reordered.
+-bump limit should prevent further replies, not just mark the thread
+for deletion -add a thread limit
 
-PLAN 13 - COMPLETE
--leverage browser caching to cut bandwidth, especially for uploads (the biggest hog)
--uploads are immutable (path is uploads/<rowid>.<ext> and ids are AUTOINCREMENT, never
-reused), so serve them with Cache-Control: public, max-age=1y, immutable so the browser
-serves repeat views from cache with no revalidation round-trip (mongoose already sends an
-Etag for a cheap 304 after expiry/eviction)
--static assets (style.css, htmx.min.js) can change, so cache them for a modest window
-(max-age=1h) and rely on the Etag for revalidation after that
--dynamic HTML (catalog, thread pages) must stay fresh, so send Cache-Control: no-cache
-so it is always revalidated and never heuristically cached stale
+PLAN 13 - COMPLETE 
+-leverage browser caching to cut bandwidth,
+especially for uploads (the biggest hog) -uploads are immutable (path
+is uploads/<rowid>.<ext> and ids are AUTOINCREMENT, never reused),
+so serve them with Cache-Control: public, max-age=1y, immutable so the
+browser serves repeat views from cache with no revalidation round-trip
+(mongoose already sends an Etag for a cheap 304 after expiry/eviction)
+-static assets (style.css, htmx.min.js) can change, so cache them for
+a modest window (max-age=1h) and rely on the Etag for revalidation
+after that -dynamic HTML (catalog, thread pages) must stay fresh,
+so send Cache-Control: no-cache so it is always revalidated and never
+heuristically cached stale Note- Claude wrote this plan after completing
+the work during a freeform chat
 
-PLAN 14 - COMPLETE
--replace growable hash table with a fixed size cache that replaces the entry on collision
+PLAN 14 - COMPLETE 
+-replace growable hash table with a fixed size cache
+that replaces the entry on collision
 
-PLAN 15 - COMPLETE
--reject large uploads based on content-length, don't try to read the whole thing and then
-decide it needs to be rejected. See if there's a toggle on the route or somewhere else
-to do this natively through mongoose, otherwise, check the header on intake
-rejection should surface a "Too large!" message in the same place we surface the rate limit 
-error
+PLAN 15 - COMPLETE 
+-reject large uploads based on content-length, don't
+try to read the whole thing and then decide it needs to be rejected. See
+if there's a toggle on the route or somewhere else to do this natively
+through mongoose, otherwise, check the header on intake rejection should
+surface a "Too large!" message in the same place we surface the rate
+limit error.  Note- for this one, claude had some trouble on its own with
+producing the desired result. It probably could have figured it out given 
+enough time, but I was worried about using up a lot of tokens so i stepped 
+through the code with gdb to figure out how the is_closing flag actually 
+worked.
 
+PLAN 16 - COMPLETE
+add a preliminary step to build the vendored mongoose and sqlite libs
+as their own compilation units. The goal is to get a compile time speedup
 
