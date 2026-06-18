@@ -26,6 +26,11 @@
 #define MAX_SUBJECT 256
 #define MAX_COMMENT 4096
 #define MAX_UPLOAD (8 * 1024 * 1024)  // 8 MiB
+// Largest request body we accept: an 8 MiB upload plus a small multipart/field
+// envelope. A request whose Content-Length exceeds this is rejected at the header
+// stage (before the body is read), so an oversized upload can't fill the recv
+// buffer up to MG_MAX_RECV_SIZE and trigger mongoose's mid-stream connection abort.
+#define MAX_REQUEST_BYTES (MAX_UPLOAD + 65536)
 #ifndef BUMP_LIMIT
 #define BUMP_LIMIT 300                // posts (OP + replies); the limit BLOCKS further replies
 #endif
@@ -308,6 +313,17 @@ static void page_head(struct sbuf *s, const char *title) {
       "addEventListener('htmx:afterRequest',function(e){"
       "var n=document.getElementById('notice');"
       "if(n&&e.detail.successful)n.textContent='';});</script>");
+  // Client-side guard: reject an over-size file before uploading it, so the user
+  // gets an instant "Too large!" instead of a multi-MB upload that the server
+  // rejects mid-stream. The server still enforces the limit; this is purely UX.
+  sb_printf(s,
+      "<script>addEventListener('htmx:beforeRequest',function(e){"
+      "var f=e.target.querySelector&&e.target.querySelector('input[type=file]');"
+      "if(f&&f.files&&f.files[0]&&f.files[0].size>%d){"
+      "e.preventDefault();"
+      "var n=document.getElementById('notice');"
+      "if(n)n.textContent='Too large!';}});</script>",
+      MAX_UPLOAD);
   sb_puts(s, "</head><body>");
   sb_puts(s, "<div class=\"banner\"><h1>" BOARD_TITLE "</h1>");
   sb_puts(s, "<div class=\"sub\">" BOARD_SUB "</div></div><hr>");
@@ -999,7 +1015,7 @@ static void handle_new_thread(struct mg_connection *c, struct mg_http_message *h
     mg_http_reply(c, 400, TEXT_HDRS, "Comment required.");
     return;
   }
-
+  
   sqlite3_int64 now = (sqlite3_int64) time(NULL);
   char ip[48];
   client_ip(c, hm, ip, sizeof(ip));
@@ -1159,6 +1175,14 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
 // Routing.
 // ---------------------------------------------------------------------------
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
+  if (c->is_closing) return;
+  if (ev == MG_EV_HTTP_HDRS) {
+    struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+    if (hm->body.len > MAX_REQUEST_BYTES) {
+      c->is_closing = 1; // close right away, don't even wait to respond
+    }
+    return;
+  }
   if (ev != MG_EV_HTTP_MSG) return;
   struct mg_http_message *hm = (struct mg_http_message *) ev_data;
   struct mg_str caps[2];

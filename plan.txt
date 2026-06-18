@@ -111,3 +111,12 @@ so it is always revalidated and never heuristically cached stale
 
 PLAN 14 - COMPLETE
 -replace growable hash table with a fixed size cache that replaces the entry on collision
+
+PLAN 15 - COMPLETE
+-reject large uploads based on content-length, don't try to read the whole thing and then
+decide it needs to be rejected. See if there's a toggle on the route or somewhere else
+to do this natively through mongoose, otherwise, check the header on intake
+rejection should surface a "Too large!" message in the same place we surface the rate limit 
+error
+
+
