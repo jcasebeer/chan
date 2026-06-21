@@ -10,6 +10,15 @@ A minimal single-board imageboard (4chan-style textboard) written in C.
 
 It's one board — no `/v/`, `/b/`, `/x/` routing. Just threads and replies.
 
+![Project Screenshot](cboard.png)
+
+## About
+
+This was a fun project done in a couple of afternoons, mainly as an experiment with ai codegen
+and to try htmx. I wanted something that was fully self contained so all of the C libs
+I chose are single header/.c file pairs. Page renders use a stack based allocator instead of
+malloc/free. Rate limits use a simple evict on collision cache. 
+
 ## LLM note
 
 This entire thing was built with a (guided) llm (opus 4.8) in ~4 hours over two sessions. 
@@ -17,7 +26,7 @@ You can see the prompts used in plan.txt. For the first 10 plans, each instructi
 llm was just /goal read and execute the next part of the PLAN. For the remaining plans there
 was some follow-up in the chat interface that's not recorded here. I tried to run a few rounds 
 of simulated penetration testing with the llm (PLAN 7, PLAN8, PLAN10) but this code is likely
-not very trustworthy for now. 
+not very trustworthy for now. Claude's findings can be found in the security.md file.
 
 ## Build & run
 
