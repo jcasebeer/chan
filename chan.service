@@ -5,6 +5,7 @@ After=network.target
 [Service]
 WorkingDirectory=/srv/chan
 ExecStart=/srv/chan/chan "http://0.0.0.0:8001"
+EnvironmentFile=/etc/chan.env
 Restart=always
 User=www-data
 
