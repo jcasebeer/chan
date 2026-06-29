@@ -14,7 +14,7 @@
 #include "mongoose.h"
 #include "sqlite3.h"
 
-#define BOARD_TITLE "/c/ - C Board"
+#define BOARD_TITLE "CHAN"
 #define BOARD_SUB "a tiny imageboard written in C"
 #define WEB_ROOT "web"
 #define UPLOAD_DIR WEB_ROOT "/uploads"
@@ -330,7 +330,7 @@ static void page_head(struct sbuf *s, const char *title) {
 }
 
 static void page_foot(struct sbuf *s) {
-  sb_puts(s, "<hr><div class=\"nav\">chan &mdash; mongoose + sqlite + htmx</div>");
+  sb_puts(s, "<hr><div class=\"nav\">chan &mdash; please be kind</div>");
   sb_puts(s, "</body></html>");
 }
 
