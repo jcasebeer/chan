@@ -1,5 +1,5 @@
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter
+CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -DCLOUDFLARED
 INCS     = -Ivendor
 # mongoose + sqlite need pthread, dl, math
 LIBS     = -lpthread -ldl -lm

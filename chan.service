@@ -1,0 +1,12 @@
+[Unit]
+Description=Chan Imageboard Service
+After=network.target
+
+[Service]
+WorkingDirectory=/srv/chan
+ExecStart=/srv/chan/chan "http://0.0.0.0:8001"
+Restart=always
+User=www-data
+
+[Install]
+WantedBy=multi-user.target
