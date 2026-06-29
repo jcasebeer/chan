@@ -48,10 +48,22 @@
 #endif
 #define UPLOAD_LOG "uploads.log"
 
+// Which header carries the real client IP when sitting behind a trusted proxy
+// (see client_ip / $CHAN_TRUSTED_PROXY). Default is X-Forwarded-For. Build with
+// -DCLOUDFLARED to use CF-Connecting-IP instead: behind a Cloudflare Tunnel the
+// left-most X-Forwarded-For entry can be spoofed by the client, whereas
+// CF-Connecting-IP is set by Cloudflare's own edge and isn't client-forgeable.
+#ifdef CLOUDFLARED
+#define CLIENT_IP_HEADER "CF-Connecting-IP"
+#else
+#define CLIENT_IP_HEADER "X-Forwarded-For"
+#endif
+
 // Security headers for HTML responses: block content sniffing, framing
 // (clickjacking), and external resource loads. 'unsafe-inline' is required
-// because the UI uses inline <script>/onclick/hx-on handlers; server output is
-// HTML-escaped, so CSP here is defense-in-depth.
+// because the UI uses inline <script> blocks and onclick handlers; server output
+// is HTML-escaped, so CSP here is defense-in-depth. ('unsafe-eval' is NOT granted,
+// so we avoid htmx's hx-on, which evaluates via new Function -- see page_head.)
 #define HTML_HDRS                                                             \
   "Content-Type: text/html; charset=utf-8\r\n"                               \
   "Cache-Control: no-cache\r\n"                                              \
@@ -311,8 +323,12 @@ static void page_head(struct sbuf *s, const char *title) {
       "var n=document.getElementById('notice');"
       "if(n)n.textContent=e.detail.xhr.responseText||('Error '+e.detail.xhr.status);});"
       "addEventListener('htmx:afterRequest',function(e){"
-      "var n=document.getElementById('notice');"
-      "if(n&&e.detail.successful)n.textContent='';});</script>");
+      "if(!e.detail.successful)return;"
+      "var n=document.getElementById('notice');if(n)n.textContent='';"
+      // Clear the post form after a successful submit. (Done here in a real
+      // inline <script> rather than via hx-on, because hx-on evaluates its body
+      // with new Function(), which our CSP blocks for lack of 'unsafe-eval'.)
+      "var f=e.target;if(f&&f.id==='postform'&&f.reset)f.reset();});</script>");
   // Client-side guard: reject an over-size file before uploading it, so the user
   // gets an instant "Too large!" instead of a multi-MB upload that the server
   // rejects mid-stream. The server still enforces the limit; this is purely UX.
@@ -343,15 +359,13 @@ static void render_form(struct sbuf *s, long thread_id) {
   if (thread_id == 0) {
     sb_puts(s, "<form id=\"postform\" class=\"postform\" "
                "enctype=\"multipart/form-data\" hx-post=\"/post\" "
-               "hx-target=\"#catalog\" hx-swap=\"afterbegin\" "
-               "hx-on::after-request=\"if(event.detail.successful)this.reset()\">");
+               "hx-target=\"#catalog\" hx-swap=\"afterbegin\">");
   } else {
     // Swap the whole thread so reply backlinks on quoted posts update too.
     sb_printf(s,
               "<form id=\"postform\" class=\"postform\" "
               "enctype=\"multipart/form-data\" hx-post=\"/reply/%ld\" "
-              "hx-target=\"#thread-%ld\" hx-swap=\"innerHTML\" "
-              "hx-on::after-request=\"if(event.detail.successful)this.reset()\">",
+              "hx-target=\"#thread-%ld\" hx-swap=\"innerHTML\">",
               thread_id, thread_id);
   }
   sb_puts(s, "<table><tr><td class=\"lbl\">Name</td>"
@@ -725,29 +739,36 @@ static void delete_thread_files(sqlite3_int64 tid);  // defined with pruning bel
 // Client IP (used for rate limiting and the upload log).
 // ---------------------------------------------------------------------------
 // Configured at startup from $CHAN_TRUSTED_PROXY (the reverse proxy's IP
-// address). We honor an X-Forwarded-For header ONLY when the request actually
-// arrives from that proxy; for any other peer the header is ignored and the TCP
-// peer address is used. This stops direct clients from spoofing XFF to bypass
-// rate limiting or forge their logged identity. Empty => never trust XFF.
+// address). We honor the forwarded-client-IP header (CLIENT_IP_HEADER:
+// X-Forwarded-For, or CF-Connecting-IP under -DCLOUDFLARED) ONLY when the request
+// actually arrives from that proxy; for any other peer the header is ignored and
+// the TCP peer address is used. This stops direct clients from spoofing the
+// header to bypass rate limiting or forge their logged identity. Empty => never
+// trust the forwarded header.
 static char g_trusted_proxy[48];
+
+// Admin password, read once at startup from $CHAN_ADMIN_PASS. Empty => the
+// admin delete feature is disabled (a ?del request is treated as a normal GET).
+static char g_admin_pass[128];
 
 static void client_ip(struct mg_connection *c, struct mg_http_message *hm,
                       char *buf, size_t n) {
   char peer[48];
   mg_snprintf(peer, sizeof(peer), "%M", mg_print_ip, &c->rem);
   if (g_trusted_proxy[0] && strcmp(peer, g_trusted_proxy) == 0) {
-    struct mg_str *xff = mg_http_get_header(hm, "X-Forwarded-For");
-    if (xff != NULL && xff->len > 0) {
-      // X-Forwarded-For: client, proxy1, proxy2 ... — the left-most entry is
-      // the original client. Take it and trim surrounding whitespace.
+    struct mg_str *fwd = mg_http_get_header(hm, CLIENT_IP_HEADER);
+    if (fwd != NULL && fwd->len > 0) {
+      // X-Forwarded-For: client, proxy1, proxy2 ... — the left-most entry is the
+      // original client. CF-Connecting-IP is a single address, so the same
+      // "up to the first comma" parse yields the whole value. Trim whitespace.
       size_t i = 0;
-      while (i < xff->len && (xff->buf[i] == ' ' || xff->buf[i] == '\t')) i++;
+      while (i < fwd->len && (fwd->buf[i] == ' ' || fwd->buf[i] == '\t')) i++;
       size_t e = i;
-      while (e < xff->len && xff->buf[e] != ',') e++;
-      while (e > i && (xff->buf[e - 1] == ' ' || xff->buf[e - 1] == '\t')) e--;
+      while (e < fwd->len && fwd->buf[e] != ',') e++;
+      while (e > i && (fwd->buf[e - 1] == ' ' || fwd->buf[e - 1] == '\t')) e--;
       size_t len = e - i;
       if (len > 0 && len < n) {
-        memcpy(buf, xff->buf + i, len);
+        memcpy(buf, fwd->buf + i, len);
         buf[len] = '\0';
         return;
       }
@@ -1172,6 +1193,175 @@ static void handle_reply(struct mg_connection *c, struct mg_http_message *hm,
 }
 
 // ---------------------------------------------------------------------------
+// Admin moderation: delete a thread or an uploaded file.
+// ---------------------------------------------------------------------------
+// A request carrying the ?del query string is an out-of-band moderation action.
+// (Yes, mutating on GET breaks REST -- intentional: it lets a moderator delete
+// straight from the address bar, gated only by the browser's native Basic Auth
+// box.) Auth is HTTP Basic: user "admin", password from $CHAN_ADMIN_PASS.
+//
+//   /thread/N?del      delete the whole thread (OP + replies + uploads)
+//   /thread/N?del=P    blank out just post P's text (it stays as a tombstone)
+//   /uploads/F?del     delete just the uploaded file F
+//
+// Note a fragment like /thread/N#pP is client-only and never reaches the server,
+// so the post is selected via the del=P query value, not the #pP anchor.
+
+// Look for a "del" token in the query string. Returns 1 if present. A bare ?del
+// leaves *val empty (delete the whole thread / the file); ?del=P copies P into
+// val (delete just post P's text). val must hold at least 1 byte.
+static int wants_delete(struct mg_str q, char *val, size_t vlen) {
+  struct mg_str tok;
+  val[0] = '\0';
+  while (mg_span(q, &tok, &q, '&')) {
+    struct mg_str k, v;
+    mg_span(tok, &k, &v, '=');  // k = before '=', v = after (len 0 if no '=')
+    if (mg_strcmp(k, mg_str("del")) == 0) {
+      if (v.len > 0) mg_snprintf(val, vlen, "%.*s", (int) v.len, v.buf);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// Verify HTTP Basic credentials against the configured admin password.
+static int admin_authed(struct mg_http_message *hm) {
+  char user[64], pass[128];
+  mg_http_creds(hm, user, sizeof(user), pass, sizeof(pass));
+  return strcmp(user, "admin") == 0 && strcmp(pass, g_admin_pass) == 0;
+}
+
+// Delete a whole thread (OP + replies) and all its uploaded files.
+static void admin_delete_thread(sqlite3_int64 tid) {
+  delete_thread_files(tid);
+  sqlite3_stmt *st;
+  if (sqlite3_prepare_v2(g_db, "DELETE FROM posts WHERE id=? OR thread_id=?",
+                         -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_int64(st, 1, tid);
+    sqlite3_bind_int64(st, 2, tid);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+  }
+  printf("admin deleted thread %lld\n", (long long) tid);
+}
+
+// Moderate a single post: delete its uploaded image (if any) and replace its
+// text with "removed by admin", leaving the row in place as a tombstone. Scoped
+// to the given thread: pid must be that thread's OP (id == tid) or a reply in it
+// (thread_id == tid), so a /thread/T URL can only moderate posts that actually
+// belong to thread T.
+static void admin_delete_post(sqlite3_int64 tid, sqlite3_int64 pid) {
+  sqlite3_stmt *st;
+  // Unlink the image file first (the row's image path is the source of truth).
+  if (sqlite3_prepare_v2(g_db,
+          "SELECT image FROM posts WHERE id=? AND (id=? OR thread_id=?) "
+          "AND image IS NOT NULL",
+          -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_int64(st, 1, pid);
+    sqlite3_bind_int64(st, 2, tid);
+    sqlite3_bind_int64(st, 3, tid);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+      const char *img = (const char *) sqlite3_column_text(st, 0);
+      if (img && img[0]) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", WEB_ROOT, img);
+        remove(path);
+      }
+    }
+    sqlite3_finalize(st);
+  }
+  // Then blank the text and drop the image reference. (comment is NOT NULL in
+  // the schema, so it carries the tombstone marker rather than being NULLed.)
+  if (sqlite3_prepare_v2(g_db,
+          "UPDATE posts SET comment='removed by admin', name=NULL, "
+          "subject=NULL, image=NULL WHERE id=? AND (id=? OR thread_id=?)",
+          -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_int64(st, 1, pid);
+    sqlite3_bind_int64(st, 2, tid);
+    sqlite3_bind_int64(st, 3, tid);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+  }
+  printf("admin removed post %lld in thread %lld\n", (long long) pid,
+         (long long) tid);
+}
+
+// Delete one uploaded file (by its stored "uploads/<id>.<ext>" path) from disk
+// and clear the DB reference so its thumbnail no longer dangles. Returns the
+// thread the file belonged to (for a redirect back), or 0 if not found.
+static sqlite3_int64 admin_delete_upload(const char *image) {
+  sqlite3_int64 tid = 0;
+  sqlite3_stmt *st;
+  // An OP has thread_id NULL, so COALESCE down to its own id.
+  if (sqlite3_prepare_v2(g_db,
+          "SELECT COALESCE(thread_id, id) FROM posts WHERE image=?", -1, &st,
+          NULL) == SQLITE_OK) {
+    sqlite3_bind_text(st, 1, image, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) tid = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+  }
+  char path[256];
+  snprintf(path, sizeof(path), "%s/%s", WEB_ROOT, image);
+  remove(path);
+  if (sqlite3_prepare_v2(g_db, "UPDATE posts SET image=NULL WHERE image=?", -1,
+                         &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_text(st, 1, image, -1, SQLITE_STATIC);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+  }
+  printf("admin deleted upload %s\n", image);
+  return tid;
+}
+
+// Handle a ?del request. Returns 1 if it consumed the request (challenge sent,
+// deleted, or rejected), 0 if it is not an admin action and routing should run.
+static int handle_admin_delete(struct mg_connection *c,
+                               struct mg_http_message *hm) {
+  char del_val[32];
+  if (g_admin_pass[0] == '\0' || !wants_delete(hm->query, del_val, sizeof(del_val)))
+    return 0;
+  if (!admin_authed(hm)) {
+    mg_http_reply(c, 401,
+                  "WWW-Authenticate: Basic realm=\"chan admin\"\r\n" TEXT_HDRS,
+                  "Authentication required.\n");
+    return 1;
+  }
+  struct mg_str caps[1];
+  if (mg_match(hm->uri, mg_str("/thread/*"), caps)) {
+    sqlite3_int64 tid = strtoll(caps[0].buf, NULL, 10);
+    if (del_val[0]) {
+      // ?del=P -- moderate just post P, then return to the thread anchored at it.
+      sqlite3_int64 pid = strtoll(del_val, NULL, 10);
+      admin_delete_post(tid, pid);
+      char loc[64];
+      mg_snprintf(loc, sizeof(loc), "Location: /thread/%lld#p%lld\r\n",
+                  (long long) tid, (long long) pid);
+      mg_http_reply(c, 302, loc, "");
+    } else {
+      // bare ?del -- delete the whole thread; back to the catalog.
+      admin_delete_thread(tid);
+      mg_http_reply(c, 302, "Location: /\r\n", "");
+    }
+  } else if (mg_match(hm->uri, mg_str("/uploads/*"), caps)) {
+    // "*" never spans '/', so the capture is a single flat filename; rebuild the
+    // stored "uploads/<file>" path from it (uploads/ is a flat directory).
+    char image[128];
+    mg_snprintf(image, sizeof(image), "uploads/%.*s", (int) caps[0].len,
+                caps[0].buf);
+    sqlite3_int64 tid = admin_delete_upload(image);
+    char loc[64];
+    if (tid > 0)
+      mg_snprintf(loc, sizeof(loc), "Location: /thread/%lld\r\n", (long long) tid);
+    else
+      mg_snprintf(loc, sizeof(loc), "Location: /\r\n");
+    mg_http_reply(c, 302, loc, "");  // back to the thread (or catalog)
+  } else {
+    mg_http_reply(c, 404, TEXT_HDRS, "Not found.\n");
+  }
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 // Routing.
 // ---------------------------------------------------------------------------
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
@@ -1188,6 +1378,10 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
   struct mg_str caps[2];
 
   int is_post = (mg_strcmp(hm->method, mg_str("POST")) == 0);
+
+  // Out-of-band admin delete (?del): handled before normal routing and without
+  // a scratch frame; it sends its own response (a 401 challenge or 302 redirect).
+  if (handle_admin_delete(c, hm)) return;
 
   // Open a scratch frame for the whole request; every render allocation bump-
   // allocates from the arena and is freed in one shot when we restore below.
@@ -1333,6 +1527,8 @@ int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IOLBF, 0);  // line-buffer logs so they appear promptly
   const char *tp = getenv("CHAN_TRUSTED_PROXY");
   if (tp != NULL) snprintf(g_trusted_proxy, sizeof(g_trusted_proxy), "%s", tp);
+  const char *ap = getenv("CHAN_ADMIN_PASS");
+  if (ap != NULL) snprintf(g_admin_pass, sizeof(g_admin_pass), "%s", ap);
   mkdir(UPLOAD_DIR, 0755);  // ensure upload directory exists (ok if present)
 
   // One-time scratch arena for the per-request render path (freed per request via
@@ -1352,8 +1548,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "cannot listen on %s\n", url);
     return 1;
   }
-  printf("chan listening on %s  (db: %s, trusted_proxy: %s)\n", url, DB_PATH,
-         g_trusted_proxy[0] ? g_trusted_proxy : "(none)");
+  printf("chan listening on %s  (db: %s, trusted_proxy: %s, admin: %s)\n", url,
+         DB_PATH, g_trusted_proxy[0] ? g_trusted_proxy : "(none)",
+         g_admin_pass[0] ? "enabled" : "disabled");
   time_t last_cleanup = 0;
   for (;;) {
     mg_mgr_poll(&mgr, 200);

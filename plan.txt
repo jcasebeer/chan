@@ -139,3 +139,31 @@ as their own compilation units. The goal is to get a compile time speedup
 PLAN 17 - COMPLETE
 the >>N that gets added to the right of a post when someone replies to it
 is supposed to take you to the repliers post, not fill the reply box.
+
+PLAN 18 - COMPLETE
+add a lightweight admin mechanism for deleting posts and images by having
+requests check for the query string ?del which when called should pop the
+native basic auth login box (i believe you return 401 to do this). Username
+is always admin, password should be read at start up from the CHAN_ADMIN_PASS
+environment variable. If the url is a /thread/ url, delete the thread, if it's
+a /upload/ url, delete the file. yes, I know this technically breaks rest rules
+but i don't care :)
+
+PLAN 19 - COMPLETE
+add a #define CLOUDFLARED which when enabled, uses CF_Connecting-IP for rate
+limiting instead of X-Forwarded-For
+
+PLAN 20 - COMPLETE
+extend the admin del functionality to also allow deleting the textual contents
+of a post. (So something like /thread/1#p3?del should delete post 3). Since a
+#fragment never reaches the server, this is done via ?del=P (e.g.
+/thread/1?del=3 removes post 3): it deletes the post's image too and replaces
+its text with "removed by admin", scoped so a thread URL only moderates its own
+posts.
+
+PLAN 21 - COMPLETE
+after hitting post/reply, the text box should be cleared. The forms used
+hx-on::after-request to reset themselves, but hx-on evaluates via new Function()
+which our CSP blocks (no 'unsafe-eval'), so it silently never ran. Replaced it
+with a real inline <script> htmx:afterRequest listener (allowed by
+'unsafe-inline') that resets the form on a successful submit.

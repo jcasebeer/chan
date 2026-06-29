@@ -79,7 +79,22 @@ cached objects).
   Over-limit posts get a message without losing the typed text. Behind a reverse
   proxy, set `CHAN_TRUSTED_PROXY=<proxy-ip>` to key off the left-most
   `X-Forwarded-For` entry — but only when the request actually arrives from that
-  proxy address, so direct clients can't spoof their IP
+  proxy address, so direct clients can't spoof their IP. Build with
+  `-DCLOUDFLARED` to read `CF-Connecting-IP` instead of `X-Forwarded-For` — the
+  right choice behind a Cloudflare Tunnel, where the left-most `X-Forwarded-For`
+  entry is client-forgeable but `CF-Connecting-IP` is set by Cloudflare's edge
+  (still only trusted when the request comes from `CHAN_TRUSTED_PROXY`)
+- **Admin delete**: appending `?del` to any URL triggers the browser's native
+  Basic Auth prompt (HTTP 401). Log in as `admin` with the password from
+  `$CHAN_ADMIN_PASS` (set at startup; if unset the feature is off and `?del` is
+  ignored) and the request deletes the target, then redirects back:
+  `/thread/N?del` removes the whole thread and its uploads; `/thread/N?del=P`
+  moderates just post P (deletes its image and replaces its text with "removed by
+  admin", leaving the row as a tombstone — scoped so the URL's thread can only
+  touch its own posts); `/uploads/<file>?del` removes just that file. Yes,
+  mutating on `GET` breaks REST; it's deliberate, so a mod can delete straight
+  from the address bar. (A `#pP` anchor is client-only and never reaches the
+  server, so the post is selected via `del=P`, not the fragment.)
 - **Upload log** (`uploads.log`): one tab-separated line per upload recording
   time, IP, MD5, size, original filename, and stored path (untrusted fields are
   sanitized to defeat log/terminal-escape injection)

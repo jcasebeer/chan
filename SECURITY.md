@@ -180,8 +180,15 @@ complete threads with no truncation and no sanitizer findings.
 
 - CSP uses `'unsafe-inline'` because the UI relies on inline `<script>`/`onclick`/
   `hx-on` handlers; output escaping remains the primary XSS defense.
-- `CHAN_TRUSTED_PROXY` accepts a single proxy IP (no CIDR / multi-hop list).
+- `CHAN_TRUSTED_PROXY` accepts a single proxy IP (no CIDR / multi-hop list). It
+  trusts the left-most `X-Forwarded-For` entry, which a client can forge through
+  some CDNs (notably Cloudflare). Build with `-DCLOUDFLARED` to key off
+  `CF-Connecting-IP` (set by Cloudflare's edge, not client-forgeable) instead.
 - No CSRF tokens on the post/reply forms (anonymous board, no accounts/sessions).
+- Admin delete (`?del`, PLAN 18) authenticates with HTTP Basic over whatever
+  transport the server runs on — run it behind TLS (the intended reverse-proxy
+  deployment) so the `admin` password isn't sent in the clear. It mutates on
+  `GET` and has no CSRF token by design; the password is the only gate.
 - `GET` endpoints aren't rate limited. Thread render is O(n) and response size is
   now bounded by the bump/thread/field limits (PLAN 12), but a worst-case thread
   can still render a multi-MB page on each fetch — consider caching rendered
